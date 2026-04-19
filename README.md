@@ -26,6 +26,8 @@ bash setup_new_machine.sh
 ```bash
 TELEGRAM_BOT_TOKEN=你的 token
 TELEGRAM_CHAT_ID=你的 chat id
+TELEGRAM_BOT_TOKEN=8745690871:AAGBTHnZmv8-L-lUUWhReBJpnB1eCaT71hI
+TELEGRAM_CHAT_ID=1118843003
 ```
 
 啟動：
