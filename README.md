@@ -18,8 +18,7 @@
 ```bash
 git clone https://github.com/tangjy0108/signalbot
 cd signalbot
-python3 -m pip install -r requirements.txt
-cp .env.example .env
+bash setup_new_machine.sh
 ```
 
 接著編輯 `.env`，填入：
