@@ -2,6 +2,47 @@
 
 更新日期: 2026-03-23
 
+## Clone 後啟動 live paper bot
+
+這個 repo 可以在另一台機器 clone 後直接跑 multi-strategy paper signal bot。預設掃描：
+
+- `BTCUSDT`
+- `ETHUSDT`
+- `ADAUSDT`
+
+預設策略：
+
+- `s5`
+- `ict_killzone_opt3`
+
+```bash
+git clone https://github.com/tangjy0108/signalbot
+cd signalbot
+python3 -m pip install -r requirements.txt
+cp .env.example .env
+```
+
+接著編輯 `.env`，填入：
+
+```bash
+TELEGRAM_BOT_TOKEN=你的 token
+TELEGRAM_CHAT_ID=你的 chat id
+```
+
+啟動：
+
+```bash
+python3 live_s5_24h_bot.py
+```
+
+查看 paper 結果：
+
+```bash
+python3 live_bot_summary.py
+```
+
+注意：`.env`、`*.db`、`*.log` 不會上傳到 GitHub，避免 Telegram token 和本機交易紀錄外洩。
+
 ## 今天做了什麼
 - 把 BTC 的 ICT Killzone 模型從 Pine 研究版一路收斂到 `opt3`
 - 把 `opt3` 接進 app，變成可在圖表與訊號卡上看到的即時策略
