@@ -1,0 +1,368 @@
+//@version=6
+strategy(
+    "BTC ICT Killzone MVP",
+    overlay = true,
+    pyramiding = 0,
+    initial_capital = 100000,
+    commission_type = strategy.commission.percent,
+    commission_value = 0.04,
+    process_orders_on_close = true
+)
+
+// Best used on BTC 3m/5m charts.
+// This is an objective MVP, not a full discretionary ICT model.
+
+sessionTz = input.string("America/New_York", "Session Timezone")
+allowWeekendTrades = input.bool(false, "Allow Weekend Trades")
+enableLondonReversal = input.bool(true, "Enable London Reversal")
+enableNyReversal = input.bool(true, "Enable NY OR Reversal")
+enableNyContinuation = input.bool(true, "Enable NY OR Continuation")
+forceFlatAfterNyWindow = input.bool(true, "Force Flat After 11:00 ET")
+biasMode = input.string("EMA Only", "Bias Filter", options = ["EMA Only", "Daily Open + EMA", "No Bias Filter"])
+entryMode = input.string("Market On Confirm", "Entry Mode", options = ["Market On Confirm", "FVG Midpoint Retest"])
+requireFvgForConfirm = input.bool(false, "Require FVG For Confirmation")
+showDebugMarkers = input.bool(true, "Show Debug Markers")
+showDebugTable = input.bool(true, "Show Debug Table")
+
+rrTarget = input.float(2.0, "Take Profit (R)", minval = 0.5, step = 0.25)
+atrLength = input.int(14, "ATR Length", minval = 1)
+displacementAtrMult = input.float(0.5, "Displacement Body ATR Mult", minval = 0.1, step = 0.1)
+sweepBufferAtrMult = input.float(0.10, "Sweep Buffer ATR Mult", minval = 0.0, step = 0.05)
+stopBufferAtrMult = input.float(0.20, "Stop Buffer ATR Mult", minval = 0.0, step = 0.05)
+structureLookback = input.int(3, "MSS Lookback Bars", minval = 2)
+confirmBars = input.int(10, "Max Bars From Sweep To Confirm", minval = 1)
+retestBars = input.int(20, "Max Bars To Fill FVG Limit", minval = 1)
+biasFastLen = input.int(20, "H1 Fast EMA", minval = 1)
+biasSlowLen = input.int(50, "H1 Slow EMA", minval = 2)
+
+f_minutes(_hour, _minute) =>
+    _hour * 60 + _minute
+
+f_in_session(_minuteOfDay, _startMinute, _endMinute) =>
+    _startMinute < _endMinute ?
+         (_minuteOfDay >= _startMinute and _minuteOfDay < _endMinute) :
+         (_minuteOfDay >= _startMinute or _minuteOfDay < _endMinute)
+
+etHour = hour(time, sessionTz)
+etMinute = minute(time, sessionTz)
+etMinuteOfDay = f_minutes(etHour, etMinute)
+etDayOfWeek = dayofweek(time, sessionTz)
+
+tradeDay = allowWeekendTrades or (etDayOfWeek >= dayofweek.monday and etDayOfWeek <= dayofweek.friday)
+
+inAsia = f_in_session(etMinuteOfDay, f_minutes(20, 0), f_minutes(0, 0))
+inLondon = tradeDay and f_in_session(etMinuteOfDay, f_minutes(2, 0), f_minutes(5, 0))
+inNyWindow = tradeDay and f_in_session(etMinuteOfDay, f_minutes(8, 30), f_minutes(11, 0))
+inOpeningRange = tradeDay and f_in_session(etMinuteOfDay, f_minutes(9, 30), f_minutes(10, 0))
+afterOpeningRange = inNyWindow and etMinuteOfDay >= f_minutes(10, 0)
+
+asiaStart = inAsia and not inAsia[1]
+londonStart = inLondon and not inLondon[1]
+nyWindowStart = inNyWindow and not inNyWindow[1]
+
+atr = ta.atr(atrLength)
+bodySize = math.abs(close - open)
+sweepBuffer = atr * sweepBufferAtrMult
+stopBuffer = atr * stopBufferAtrMult
+
+dailyOpen = request.security(syminfo.tickerid, "D", open, gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+h1FastEma = request.security(syminfo.tickerid, "60", ta.ema(close, biasFastLen), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+h1SlowEma = request.security(syminfo.tickerid, "60", ta.ema(close, biasSlowLen), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+bullBias = switch biasMode
+    "No Bias Filter" => true
+    "EMA Only" => h1FastEma > h1SlowEma
+    => close > dailyOpen and h1FastEma > h1SlowEma
+bearBias = switch biasMode
+    "No Bias Filter" => true
+    "EMA Only" => h1FastEma < h1SlowEma
+    => close < dailyOpen and h1FastEma < h1SlowEma
+
+bullMss = close > ta.highest(high, structureLookback)[1]
+bearMss = close < ta.lowest(low, structureLookback)[1]
+bullDisplacement = close > open and bodySize >= atr * displacementAtrMult
+bearDisplacement = close < open and bodySize >= atr * displacementAtrMult
+bullFvg = bar_index > 2 and low > high[2]
+bearFvg = bar_index > 2 and high < low[2]
+bullConfirm = bullDisplacement and bullMss and (not requireFvgForConfirm or bullFvg)
+bearConfirm = bearDisplacement and bearMss and (not requireFvgForConfirm or bearFvg)
+
+var float asiaHigh = na
+var float asiaLow = na
+if asiaStart
+    asiaHigh := high
+    asiaLow := low
+else if inAsia
+    asiaHigh := na(asiaHigh) ? high : math.max(asiaHigh, high)
+    asiaLow := na(asiaLow) ? low : math.min(asiaLow, low)
+
+var float orHigh = na
+var float orLow = na
+if nyWindowStart
+    orHigh := na
+    orLow := na
+if inOpeningRange
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow := na(orLow) ? low : math.min(orLow, low)
+
+var bool waitBullConfirm = false
+var bool waitBearConfirm = false
+var float bullSweepExtreme = na
+var float bearSweepExtreme = na
+var int bullSweepBar = na
+var int bearSweepBar = na
+
+var bool longOrderPending = false
+var bool shortOrderPending = false
+var float longEntryPrice = na
+var float shortEntryPrice = na
+var float longStop = na
+var float shortStop = na
+var float longTarget = na
+var float shortTarget = na
+var int longExpiryBar = na
+var int shortExpiryBar = na
+var int londonSweepCount = 0
+var int nySweepCount = 0
+var int confirmCount = 0
+var int orderCount = 0
+var int fillCount = 0
+
+var table debugTable = table.new(position.top_right, 2, 7, bgcolor = color.new(color.black, 80))
+
+newLongSetup = false
+newShortSetup = false
+bullSweepSignal = false
+bearSweepSignal = false
+bullConfirmSignal = false
+bearConfirmSignal = false
+
+if (londonStart or nyWindowStart) and strategy.position_size == 0
+    waitBullConfirm := false
+    waitBearConfirm := false
+    strategy.cancel("Long")
+    strategy.cancel("Short")
+    longOrderPending := false
+    shortOrderPending := false
+    longEntryPrice := na
+    shortEntryPrice := na
+    longStop := na
+    shortStop := na
+    longTarget := na
+    shortTarget := na
+    longExpiryBar := na
+    shortExpiryBar := na
+
+if forceFlatAfterNyWindow and not inNyWindow and etMinuteOfDay >= f_minutes(11, 0)
+    strategy.close("Long", comment = "Flat After NY")
+    strategy.close("Short", comment = "Flat After NY")
+    strategy.cancel("Long")
+    strategy.cancel("Short")
+
+if strategy.position_size == 0 and not longOrderPending and not shortOrderPending
+    if enableLondonReversal and inLondon and not na(asiaLow) and bullBias and low < asiaLow - sweepBuffer
+        if not waitBullConfirm
+            londonSweepCount += 1
+            bullSweepSignal := true
+        waitBullConfirm := true
+        waitBearConfirm := false
+        bullSweepExtreme := na(bullSweepExtreme) ? low : math.min(bullSweepExtreme, low)
+        bullSweepBar := bar_index
+    if enableLondonReversal and inLondon and not na(asiaHigh) and bearBias and high > asiaHigh + sweepBuffer
+        if not waitBearConfirm
+            londonSweepCount += 1
+            bearSweepSignal := true
+        waitBearConfirm := true
+        waitBullConfirm := false
+        bearSweepExtreme := na(bearSweepExtreme) ? high : math.max(bearSweepExtreme, high)
+        bearSweepBar := bar_index
+    if enableNyReversal and afterOpeningRange and not na(orLow) and bullBias and low < orLow - sweepBuffer and close > orLow
+        if not waitBullConfirm
+            nySweepCount += 1
+            bullSweepSignal := true
+        waitBullConfirm := true
+        waitBearConfirm := false
+        bullSweepExtreme := na(bullSweepExtreme) ? low : math.min(bullSweepExtreme, low)
+        bullSweepBar := bar_index
+    if enableNyReversal and afterOpeningRange and not na(orHigh) and bearBias and high > orHigh + sweepBuffer and close < orHigh
+        if not waitBearConfirm
+            nySweepCount += 1
+            bearSweepSignal := true
+        waitBearConfirm := true
+        waitBullConfirm := false
+        bearSweepExtreme := na(bearSweepExtreme) ? high : math.max(bearSweepExtreme, high)
+        bearSweepBar := bar_index
+
+if waitBullConfirm and not na(bullSweepBar) and bar_index - bullSweepBar > confirmBars
+    waitBullConfirm := false
+    bullSweepExtreme := na
+    bullSweepBar := na
+
+if waitBearConfirm and not na(bearSweepBar) and bar_index - bearSweepBar > confirmBars
+    waitBearConfirm := false
+    bearSweepExtreme := na
+    bearSweepBar := na
+
+if waitBullConfirm and bullConfirm and strategy.position_size == 0 and not longOrderPending and not shortOrderPending
+    bullConfirmSignal := true
+    confirmCount += 1
+    longEntryPrice := entryMode == "FVG Midpoint Retest" ? (bullFvg ? (low + high[2]) / 2.0 : na) : close
+    longStop := bullSweepExtreme - stopBuffer
+    if not na(longEntryPrice) and longEntryPrice > longStop
+        longTarget := longEntryPrice + (longEntryPrice - longStop) * rrTarget
+        longExpiryBar := bar_index + retestBars
+        longOrderPending := true
+        newLongSetup := true
+        orderCount += 1
+        if entryMode == "FVG Midpoint Retest"
+            strategy.entry("Long", strategy.long, limit = longEntryPrice)
+        else
+            strategy.entry("Long", strategy.long)
+    waitBullConfirm := false
+    bullSweepExtreme := na
+    bullSweepBar := na
+
+if waitBearConfirm and bearConfirm and strategy.position_size == 0 and not longOrderPending and not shortOrderPending
+    bearConfirmSignal := true
+    confirmCount += 1
+    shortEntryPrice := entryMode == "FVG Midpoint Retest" ? (bearFvg ? (high + low[2]) / 2.0 : na) : close
+    shortStop := bearSweepExtreme + stopBuffer
+    if not na(shortEntryPrice) and shortEntryPrice < shortStop
+        shortTarget := shortEntryPrice - (shortStop - shortEntryPrice) * rrTarget
+        shortExpiryBar := bar_index + retestBars
+        shortOrderPending := true
+        newShortSetup := true
+        orderCount += 1
+        if entryMode == "FVG Midpoint Retest"
+            strategy.entry("Short", strategy.short, limit = shortEntryPrice)
+        else
+            strategy.entry("Short", strategy.short)
+    waitBearConfirm := false
+    bearSweepExtreme := na
+    bearSweepBar := na
+
+if enableNyContinuation and afterOpeningRange and strategy.position_size == 0 and not longOrderPending and not shortOrderPending
+    if bullBias and not na(orHigh) and close > orHigh and close[1] <= orHigh and bullConfirm
+        bullConfirmSignal := true
+        confirmCount += 1
+        longEntryPrice := entryMode == "FVG Midpoint Retest" ? (bullFvg ? (low + high[2]) / 2.0 : na) : close
+        longStop := math.min(orLow, low[1], low[2]) - stopBuffer
+        if not na(longEntryPrice) and longEntryPrice > longStop
+            longTarget := longEntryPrice + (longEntryPrice - longStop) * rrTarget
+            longExpiryBar := bar_index + retestBars
+            longOrderPending := true
+            newLongSetup := true
+            orderCount += 1
+            if entryMode == "FVG Midpoint Retest"
+                strategy.entry("Long", strategy.long, limit = longEntryPrice)
+            else
+                strategy.entry("Long", strategy.long)
+    if bearBias and not na(orLow) and close < orLow and close[1] >= orLow and bearConfirm
+        bearConfirmSignal := true
+        confirmCount += 1
+        shortEntryPrice := entryMode == "FVG Midpoint Retest" ? (bearFvg ? (high + low[2]) / 2.0 : na) : close
+        shortStop := math.max(orHigh, high[1], high[2]) + stopBuffer
+        if not na(shortEntryPrice) and shortEntryPrice < shortStop
+            shortTarget := shortEntryPrice - (shortStop - shortEntryPrice) * rrTarget
+            shortExpiryBar := bar_index + retestBars
+            shortOrderPending := true
+            newShortSetup := true
+            orderCount += 1
+            if entryMode == "FVG Midpoint Retest"
+                strategy.entry("Short", strategy.short, limit = shortEntryPrice)
+            else
+                strategy.entry("Short", strategy.short)
+
+if longOrderPending and strategy.position_size == 0 and not na(longExpiryBar) and bar_index > longExpiryBar
+    strategy.cancel("Long")
+    longOrderPending := false
+    longEntryPrice := na
+    longStop := na
+    longTarget := na
+    longExpiryBar := na
+
+if shortOrderPending and strategy.position_size == 0 and not na(shortExpiryBar) and bar_index > shortExpiryBar
+    strategy.cancel("Short")
+    shortOrderPending := false
+    shortEntryPrice := na
+    shortStop := na
+    shortTarget := na
+    shortExpiryBar := na
+
+longFilled = strategy.position_size > 0 and strategy.position_size[1] <= 0
+shortFilled = strategy.position_size < 0 and strategy.position_size[1] >= 0
+
+if longFilled
+    fillCount += 1
+    longOrderPending := false
+    strategy.cancel("Short")
+    shortOrderPending := false
+    shortEntryPrice := na
+    shortStop := na
+    shortTarget := na
+    shortExpiryBar := na
+
+if shortFilled
+    fillCount += 1
+    shortOrderPending := false
+    strategy.cancel("Long")
+    longOrderPending := false
+    longEntryPrice := na
+    longStop := na
+    longTarget := na
+    longExpiryBar := na
+
+if not na(longStop) and not na(longTarget)
+    strategy.exit("Long Exit", "Long", stop = longStop, limit = longTarget)
+
+if not na(shortStop) and not na(shortTarget)
+    strategy.exit("Short Exit", "Short", stop = shortStop, limit = shortTarget)
+
+longClosed = strategy.position_size == 0 and strategy.position_size[1] > 0
+shortClosed = strategy.position_size == 0 and strategy.position_size[1] < 0
+
+if longClosed and not longOrderPending
+    longEntryPrice := na
+    longStop := na
+    longTarget := na
+    longExpiryBar := na
+
+if shortClosed and not shortOrderPending
+    shortEntryPrice := na
+    shortStop := na
+    shortTarget := na
+    shortExpiryBar := na
+
+plot(asiaHigh, "Asia High", color = color.new(color.teal, 0), linewidth = 1, style = plot.style_linebr)
+plot(asiaLow, "Asia Low", color = color.new(color.teal, 0), linewidth = 1, style = plot.style_linebr)
+plot(orHigh, "NY Opening Range High", color = color.new(color.orange, 0), linewidth = 1, style = plot.style_linebr)
+plot(orLow, "NY Opening Range Low", color = color.new(color.orange, 0), linewidth = 1, style = plot.style_linebr)
+
+bgcolor(inLondon ? color.new(color.blue, 92) : na, title = "London Window")
+bgcolor(inNyWindow ? color.new(color.red, 92) : na, title = "NY Window")
+
+plotshape(newLongSetup, title = "New Long Setup", style = shape.triangleup, location = location.belowbar, color = color.lime, size = size.tiny, text = "L")
+plotshape(newShortSetup, title = "New Short Setup", style = shape.triangledown, location = location.abovebar, color = color.red, size = size.tiny, text = "S")
+plotshape(showDebugMarkers and bullSweepSignal, title = "Bull Sweep", style = shape.circle, location = location.belowbar, color = color.aqua, size = size.tiny, text = "SW")
+plotshape(showDebugMarkers and bearSweepSignal, title = "Bear Sweep", style = shape.circle, location = location.abovebar, color = color.fuchsia, size = size.tiny, text = "SW")
+plotshape(showDebugMarkers and bullConfirmSignal, title = "Bull Confirm", style = shape.square, location = location.belowbar, color = color.green, size = size.tiny, text = "CF")
+plotshape(showDebugMarkers and bearConfirmSignal, title = "Bear Confirm", style = shape.square, location = location.abovebar, color = color.maroon, size = size.tiny, text = "CF")
+
+if barstate.islast and showDebugTable
+    table.cell(debugTable, 0, 0, "Metric", text_color = color.white)
+    table.cell(debugTable, 1, 0, "Count", text_color = color.white)
+    table.cell(debugTable, 0, 1, "London Sweeps", text_color = color.aqua)
+    table.cell(debugTable, 1, 1, str.tostring(londonSweepCount), text_color = color.aqua)
+    table.cell(debugTable, 0, 2, "NY Sweeps", text_color = color.fuchsia)
+    table.cell(debugTable, 1, 2, str.tostring(nySweepCount), text_color = color.fuchsia)
+    table.cell(debugTable, 0, 3, "Confirms", text_color = color.lime)
+    table.cell(debugTable, 1, 3, str.tostring(confirmCount), text_color = color.lime)
+    table.cell(debugTable, 0, 4, "Orders Placed", text_color = color.orange)
+    table.cell(debugTable, 1, 4, str.tostring(orderCount), text_color = color.orange)
+    table.cell(debugTable, 0, 5, "Orders Filled", text_color = color.yellow)
+    table.cell(debugTable, 1, 5, str.tostring(fillCount), text_color = color.yellow)
+    table.cell(debugTable, 0, 6, "Entry Mode", text_color = color.white)
+    table.cell(debugTable, 1, 6, entryMode, text_color = color.white)
+
+alertcondition(newLongSetup, "BTC Killzone Long Setup", "New BTC ICT Killzone long setup")
+alertcondition(newShortSetup, "BTC Killzone Short Setup", "New BTC ICT Killzone short setup")

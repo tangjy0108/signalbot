@@ -1,0 +1,457 @@
+//@version=6
+strategy(
+    "BTC ICT Killzone Opt5",
+    overlay = true,
+    pyramiding = 0,
+    initial_capital = 100000,
+    commission_type = strategy.commission.percent,
+    commission_value = 0.04,
+    process_orders_on_close = true
+)
+
+// Opt5:
+// Clean experiment against Opt3.
+// Keep Opt3's NY long filter, and tighten NY shorts using an OR-high sweep requirement.
+
+sessionTz = input.string("America/New_York", "Session Timezone")
+allowWeekendTrades = input.bool(false, "Allow Weekend Trades")
+enableLondonReversal = input.bool(true, "Enable London Reversal")
+enableNyReversal = input.bool(true, "Enable NY OR Reversal")
+enableNyContinuation = input.bool(true, "Enable NY OR Continuation")
+forceFlatAfterNyWindow = input.bool(true, "Force Flat After 11:00 ET")
+
+biasMode = input.string("EMA Only", "Bias Filter", options = ["EMA Only", "Daily Open + EMA", "No Bias Filter"])
+entryMode = input.string("Market On Confirm", "Entry Mode", options = ["Market On Confirm", "FVG Midpoint Retest"])
+directionMode = input.string("Both", "Direction Mode", options = ["Both", "Long Only", "Short Only"])
+requireFvgForNyLong = input.bool(true, "Require FVG For NY Longs")
+requireOrHighSweepForNyShort = input.bool(true, "Require OR High Sweep For NY Shorts")
+
+rrTarget = input.float(2.0, "Take Profit (R)", minval = 0.5, step = 0.25)
+atrLength = input.int(14, "ATR Length", minval = 1)
+displacementAtrMult = input.float(0.5, "Displacement Body ATR Mult", minval = 0.1, step = 0.1)
+sweepBufferAtrMult = input.float(0.10, "Sweep Buffer ATR Mult", minval = 0.0, step = 0.05)
+stopBufferAtrMult = input.float(0.20, "Stop Buffer ATR Mult", minval = 0.0, step = 0.05)
+structureLookback = input.int(3, "MSS Lookback Bars", minval = 2)
+confirmBars = input.int(10, "Max Bars From Sweep To Confirm", minval = 1)
+retestBars = input.int(20, "Max Bars To Fill FVG Limit", minval = 1)
+biasFastLen = input.int(20, "H1 Fast EMA", minval = 1)
+biasSlowLen = input.int(50, "H1 Slow EMA", minval = 2)
+
+showDebugMarkers = input.bool(true, "Show Debug Markers")
+showAuditTable = input.bool(true, "Show Audit Table")
+tablePositionInput = input.string("Top Right", "Audit Table Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"])
+
+f_minutes(_hour, _minute) =>
+    _hour * 60 + _minute
+
+f_in_session(_minuteOfDay, _startMinute, _endMinute) =>
+    _startMinute < _endMinute ?
+         (_minuteOfDay >= _startMinute and _minuteOfDay < _endMinute) :
+         (_minuteOfDay >= _startMinute or _minuteOfDay < _endMinute)
+
+etHour = hour(time, sessionTz)
+etMinute = minute(time, sessionTz)
+etMinuteOfDay = f_minutes(etHour, etMinute)
+etDayOfWeek = dayofweek(time, sessionTz)
+
+tradeDay = allowWeekendTrades or (etDayOfWeek >= dayofweek.monday and etDayOfWeek <= dayofweek.friday)
+allowLongs = directionMode != "Short Only"
+allowShorts = directionMode != "Long Only"
+
+inAsia = f_in_session(etMinuteOfDay, f_minutes(20, 0), f_minutes(0, 0))
+inLondon = tradeDay and f_in_session(etMinuteOfDay, f_minutes(2, 0), f_minutes(5, 0))
+inNyWindow = tradeDay and f_in_session(etMinuteOfDay, f_minutes(8, 30), f_minutes(11, 0))
+inOpeningRange = tradeDay and f_in_session(etMinuteOfDay, f_minutes(9, 30), f_minutes(10, 0))
+afterOpeningRange = inNyWindow and etMinuteOfDay >= f_minutes(10, 0)
+
+asiaStart = inAsia and not inAsia[1]
+londonStart = inLondon and not inLondon[1]
+nyWindowStart = inNyWindow and not inNyWindow[1]
+
+const int SESSION_NONE = 0
+const int SESSION_LONDON = 1
+const int SESSION_NY = 2
+
+auditTablePosition = switch tablePositionInput
+    "Top Left" => position.top_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Left" => position.bottom_left
+    => position.top_right
+
+atr = ta.atr(atrLength)
+bodySize = math.abs(close - open)
+sweepBuffer = atr * sweepBufferAtrMult
+stopBuffer = atr * stopBufferAtrMult
+
+dailyOpen = request.security(syminfo.tickerid, "D", open, gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+h1FastEma = request.security(syminfo.tickerid, "60", ta.ema(close, biasFastLen), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+h1SlowEma = request.security(syminfo.tickerid, "60", ta.ema(close, biasSlowLen), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+bullBias = switch biasMode
+    "No Bias Filter" => true
+    "EMA Only" => h1FastEma > h1SlowEma
+    => close > dailyOpen and h1FastEma > h1SlowEma
+
+bearBias = switch biasMode
+    "No Bias Filter" => true
+    "EMA Only" => h1FastEma < h1SlowEma
+    => close < dailyOpen and h1FastEma < h1SlowEma
+
+bullMss = close > ta.highest(high, structureLookback)[1]
+bearMss = close < ta.lowest(low, structureLookback)[1]
+bullDisplacement = close > open and bodySize >= atr * displacementAtrMult
+bearDisplacement = close < open and bodySize >= atr * displacementAtrMult
+bullFvg = bar_index > 2 and low > high[2]
+bearFvg = bar_index > 2 and high < low[2]
+bullConfirm = bullDisplacement and bullMss
+bearConfirm = bearDisplacement and bearMss
+
+var float asiaHigh = na
+var float asiaLow = na
+if asiaStart
+    asiaHigh := high
+    asiaLow := low
+else if inAsia
+    asiaHigh := na(asiaHigh) ? high : math.max(asiaHigh, high)
+    asiaLow := na(asiaLow) ? low : math.min(asiaLow, low)
+
+var float orHigh = na
+var float orLow = na
+if nyWindowStart
+    orHigh := na
+    orLow := na
+if inOpeningRange
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow := na(orLow) ? low : math.min(orLow, low)
+
+var bool waitBullConfirm = false
+var bool waitBearConfirm = false
+var float bullSweepExtreme = na
+var float bearSweepExtreme = na
+var int bullSweepBar = na
+var int bearSweepBar = na
+var int bullSetupSession = SESSION_NONE
+var int bearSetupSession = SESSION_NONE
+
+var bool longOrderPending = false
+var bool shortOrderPending = false
+var float longEntryPrice = na
+var float shortEntryPrice = na
+var float longStop = na
+var float shortStop = na
+var float longTarget = na
+var float shortTarget = na
+var int longExpiryBar = na
+var int shortExpiryBar = na
+var int pendingSession = SESSION_NONE
+var int openTradeSession = SESSION_NONE
+var int openTradeDirection = 0
+var float entryNetProfit = na
+var float openEntryCommission = na
+
+var int londonFillCount = 0
+var int nyFillCount = 0
+var int longFillCount = 0
+var int shortFillCount = 0
+var int londonLongFillCount = 0
+var int londonShortFillCount = 0
+var int nyLongFillCount = 0
+var int nyShortFillCount = 0
+var float londonNetProfit = 0.0
+var float nyNetProfit = 0.0
+var float longNetProfit = 0.0
+var float shortNetProfit = 0.0
+var float londonLongNetProfit = 0.0
+var float londonShortNetProfit = 0.0
+var float nyLongNetProfit = 0.0
+var float nyShortNetProfit = 0.0
+
+var table auditTable = table.new(auditTablePosition, 2, 13, bgcolor = color.new(color.black, 80))
+
+newLongSetup = false
+newShortSetup = false
+
+if (londonStart or nyWindowStart) and strategy.position_size == 0
+    waitBullConfirm := false
+    waitBearConfirm := false
+    bullSetupSession := SESSION_NONE
+    bearSetupSession := SESSION_NONE
+    pendingSession := SESSION_NONE
+    strategy.cancel("Long")
+    strategy.cancel("Short")
+    longOrderPending := false
+    shortOrderPending := false
+    longEntryPrice := na
+    shortEntryPrice := na
+    longStop := na
+    shortStop := na
+    longTarget := na
+    shortTarget := na
+    longExpiryBar := na
+    shortExpiryBar := na
+
+if forceFlatAfterNyWindow and not inNyWindow and etMinuteOfDay >= f_minutes(11, 0)
+    strategy.close("Long", comment = "Flat After NY")
+    strategy.close("Short", comment = "Flat After NY")
+    strategy.cancel("Long")
+    strategy.cancel("Short")
+
+if strategy.position_size == 0 and not longOrderPending and not shortOrderPending
+    if allowLongs and enableLondonReversal and inLondon and not na(asiaLow) and bullBias and low < asiaLow - sweepBuffer
+        waitBullConfirm := true
+        waitBearConfirm := false
+        bullSetupSession := SESSION_LONDON
+        bearSetupSession := SESSION_NONE
+        bullSweepExtreme := na(bullSweepExtreme) ? low : math.min(bullSweepExtreme, low)
+        bullSweepBar := bar_index
+    if allowShorts and enableLondonReversal and inLondon and not na(asiaHigh) and bearBias and high > asiaHigh + sweepBuffer
+        waitBearConfirm := true
+        waitBullConfirm := false
+        bearSetupSession := SESSION_LONDON
+        bullSetupSession := SESSION_NONE
+        bearSweepExtreme := na(bearSweepExtreme) ? high : math.max(bearSweepExtreme, high)
+        bearSweepBar := bar_index
+    if allowLongs and enableNyReversal and afterOpeningRange and not na(orLow) and bullBias and low < orLow - sweepBuffer and close > orLow
+        waitBullConfirm := true
+        waitBearConfirm := false
+        bullSetupSession := SESSION_NY
+        bearSetupSession := SESSION_NONE
+        bullSweepExtreme := na(bullSweepExtreme) ? low : math.min(bullSweepExtreme, low)
+        bullSweepBar := bar_index
+    if allowShorts and enableNyReversal and afterOpeningRange and not na(orHigh) and bearBias and high > orHigh + sweepBuffer and close < orHigh
+        waitBearConfirm := true
+        waitBullConfirm := false
+        bearSetupSession := SESSION_NY
+        bullSetupSession := SESSION_NONE
+        bearSweepExtreme := na(bearSweepExtreme) ? high : math.max(bearSweepExtreme, high)
+        bearSweepBar := bar_index
+
+if waitBullConfirm and not na(bullSweepBar) and bar_index - bullSweepBar > confirmBars
+    waitBullConfirm := false
+    bullSweepExtreme := na
+    bullSweepBar := na
+    bullSetupSession := SESSION_NONE
+
+if waitBearConfirm and not na(bearSweepBar) and bar_index - bearSweepBar > confirmBars
+    waitBearConfirm := false
+    bearSweepExtreme := na
+    bearSweepBar := na
+    bearSetupSession := SESSION_NONE
+
+if waitBullConfirm and bullConfirm and strategy.position_size == 0 and not longOrderPending and not shortOrderPending and (bullSetupSession != SESSION_NY or not requireFvgForNyLong or bullFvg)
+    longEntryPrice := entryMode == "FVG Midpoint Retest" ? (bullFvg ? (low + high[2]) / 2.0 : na) : close
+    longStop := bullSweepExtreme - stopBuffer
+    if not na(longEntryPrice) and longEntryPrice > longStop
+        longTarget := longEntryPrice + (longEntryPrice - longStop) * rrTarget
+        longExpiryBar := bar_index + retestBars
+        longOrderPending := true
+        pendingSession := bullSetupSession
+        newLongSetup := true
+        if entryMode == "FVG Midpoint Retest"
+            strategy.entry("Long", strategy.long, limit = longEntryPrice)
+        else
+            strategy.entry("Long", strategy.long)
+    waitBullConfirm := false
+    bullSweepExtreme := na
+    bullSweepBar := na
+    bullSetupSession := SESSION_NONE
+
+if waitBearConfirm and bearConfirm and strategy.position_size == 0 and not longOrderPending and not shortOrderPending
+    shortEntryPrice := entryMode == "FVG Midpoint Retest" ? (bearFvg ? (high + low[2]) / 2.0 : na) : close
+    shortStop := bearSweepExtreme + stopBuffer
+    if not na(shortEntryPrice) and shortEntryPrice < shortStop
+        shortTarget := shortEntryPrice - (shortStop - shortEntryPrice) * rrTarget
+        shortExpiryBar := bar_index + retestBars
+        shortOrderPending := true
+        pendingSession := bearSetupSession
+        newShortSetup := true
+        if entryMode == "FVG Midpoint Retest"
+            strategy.entry("Short", strategy.short, limit = shortEntryPrice)
+        else
+            strategy.entry("Short", strategy.short)
+    waitBearConfirm := false
+    bearSweepExtreme := na
+    bearSweepBar := na
+    bearSetupSession := SESSION_NONE
+
+if enableNyContinuation and afterOpeningRange and strategy.position_size == 0 and not longOrderPending and not shortOrderPending
+    if allowLongs and bullBias and not na(orHigh) and close > orHigh and close[1] <= orHigh and bullConfirm and (not requireFvgForNyLong or bullFvg)
+        longEntryPrice := entryMode == "FVG Midpoint Retest" ? (bullFvg ? (low + high[2]) / 2.0 : na) : close
+        longStop := math.min(orLow, low[1], low[2]) - stopBuffer
+        if not na(longEntryPrice) and longEntryPrice > longStop
+            longTarget := longEntryPrice + (longEntryPrice - longStop) * rrTarget
+            longExpiryBar := bar_index + retestBars
+            longOrderPending := true
+            pendingSession := SESSION_NY
+            newLongSetup := true
+            if entryMode == "FVG Midpoint Retest"
+                strategy.entry("Long", strategy.long, limit = longEntryPrice)
+            else
+                strategy.entry("Long", strategy.long)
+    if allowShorts and bearBias and not na(orLow) and close < orLow and close[1] >= orLow and bearConfirm and (not requireOrHighSweepForNyShort or high >= orHigh + sweepBuffer or high[1] >= orHigh + sweepBuffer or high[2] >= orHigh + sweepBuffer)
+        shortEntryPrice := entryMode == "FVG Midpoint Retest" ? (bearFvg ? (high + low[2]) / 2.0 : na) : close
+        shortStop := math.max(orHigh, high[1], high[2]) + stopBuffer
+        if not na(shortEntryPrice) and shortEntryPrice < shortStop
+            shortTarget := shortEntryPrice - (shortStop - shortEntryPrice) * rrTarget
+            shortExpiryBar := bar_index + retestBars
+            shortOrderPending := true
+            pendingSession := SESSION_NY
+            newShortSetup := true
+            if entryMode == "FVG Midpoint Retest"
+                strategy.entry("Short", strategy.short, limit = shortEntryPrice)
+            else
+                strategy.entry("Short", strategy.short)
+
+if longOrderPending and strategy.position_size == 0 and not na(longExpiryBar) and bar_index > longExpiryBar
+    strategy.cancel("Long")
+    longOrderPending := false
+    pendingSession := SESSION_NONE
+    longEntryPrice := na
+    longStop := na
+    longTarget := na
+    longExpiryBar := na
+
+if shortOrderPending and strategy.position_size == 0 and not na(shortExpiryBar) and bar_index > shortExpiryBar
+    strategy.cancel("Short")
+    shortOrderPending := false
+    pendingSession := SESSION_NONE
+    shortEntryPrice := na
+    shortStop := na
+    shortTarget := na
+    shortExpiryBar := na
+
+longFilled = strategy.position_size > 0 and strategy.position_size[1] <= 0
+shortFilled = strategy.position_size < 0 and strategy.position_size[1] >= 0
+
+if longFilled
+    openTradeSession := pendingSession
+    openTradeDirection := 1
+    entryNetProfit := strategy.netprofit
+    openEntryCommission := math.abs(strategy.position_size * strategy.position_avg_price) * 0.04 / 100.0
+    if openTradeSession == SESSION_LONDON
+        londonFillCount += 1
+        londonLongFillCount += 1
+    if openTradeSession == SESSION_NY
+        nyFillCount += 1
+        nyLongFillCount += 1
+    longFillCount += 1
+    longOrderPending := false
+    pendingSession := SESSION_NONE
+    strategy.cancel("Short")
+    shortOrderPending := false
+    shortEntryPrice := na
+    shortStop := na
+    shortTarget := na
+    shortExpiryBar := na
+
+if shortFilled
+    openTradeSession := pendingSession
+    openTradeDirection := -1
+    entryNetProfit := strategy.netprofit
+    openEntryCommission := math.abs(strategy.position_size * strategy.position_avg_price) * 0.04 / 100.0
+    if openTradeSession == SESSION_LONDON
+        londonFillCount += 1
+        londonShortFillCount += 1
+    if openTradeSession == SESSION_NY
+        nyFillCount += 1
+        nyShortFillCount += 1
+    shortFillCount += 1
+    shortOrderPending := false
+    pendingSession := SESSION_NONE
+    strategy.cancel("Long")
+    longOrderPending := false
+    longEntryPrice := na
+    longStop := na
+    longTarget := na
+    longExpiryBar := na
+
+if not na(longStop) and not na(longTarget)
+    strategy.exit("Long Exit", "Long", stop = longStop, limit = longTarget)
+
+if not na(shortStop) and not na(shortTarget)
+    strategy.exit("Short Exit", "Short", stop = shortStop, limit = shortTarget)
+
+longClosed = strategy.position_size == 0 and strategy.position_size[1] > 0
+shortClosed = strategy.position_size == 0 and strategy.position_size[1] < 0
+
+if longClosed and not longOrderPending
+    closedProfit = not na(entryNetProfit) ? strategy.netprofit - entryNetProfit - nz(openEntryCommission, 0.0) : 0.0
+    if openTradeSession == SESSION_LONDON
+        londonNetProfit += closedProfit
+        londonLongNetProfit += closedProfit
+    if openTradeSession == SESSION_NY
+        nyNetProfit += closedProfit
+        nyLongNetProfit += closedProfit
+    if openTradeDirection == 1
+        longNetProfit += closedProfit
+    openTradeSession := SESSION_NONE
+    openTradeDirection := 0
+    entryNetProfit := na
+    openEntryCommission := na
+    longEntryPrice := na
+    longStop := na
+    longTarget := na
+    longExpiryBar := na
+
+if shortClosed and not shortOrderPending
+    closedProfit = not na(entryNetProfit) ? strategy.netprofit - entryNetProfit - nz(openEntryCommission, 0.0) : 0.0
+    if openTradeSession == SESSION_LONDON
+        londonNetProfit += closedProfit
+        londonShortNetProfit += closedProfit
+    if openTradeSession == SESSION_NY
+        nyNetProfit += closedProfit
+        nyShortNetProfit += closedProfit
+    if openTradeDirection == -1
+        shortNetProfit += closedProfit
+    openTradeSession := SESSION_NONE
+    openTradeDirection := 0
+    entryNetProfit := na
+    openEntryCommission := na
+    shortEntryPrice := na
+    shortStop := na
+    shortTarget := na
+    shortExpiryBar := na
+
+plot(asiaHigh, "Asia High", color = color.new(color.teal, 0), linewidth = 1, style = plot.style_linebr)
+plot(asiaLow, "Asia Low", color = color.new(color.teal, 0), linewidth = 1, style = plot.style_linebr)
+plot(orHigh, "NY Opening Range High", color = color.new(color.orange, 0), linewidth = 1, style = plot.style_linebr)
+plot(orLow, "NY Opening Range Low", color = color.new(color.orange, 0), linewidth = 1, style = plot.style_linebr)
+
+bgcolor(inLondon ? color.new(color.blue, 92) : na, title = "London Window")
+bgcolor(inNyWindow ? color.new(color.red, 92) : na, title = "NY Window")
+
+plotshape(showDebugMarkers and newLongSetup, title = "New Long Setup", style = shape.triangleup, location = location.belowbar, color = color.lime, size = size.tiny, text = "L")
+plotshape(showDebugMarkers and newShortSetup, title = "New Short Setup", style = shape.triangledown, location = location.abovebar, color = color.red, size = size.tiny, text = "S")
+
+if showAuditTable
+    table.cell(auditTable, 0, 0, "Metric", text_color = color.white)
+    table.cell(auditTable, 1, 0, "Value", text_color = color.white)
+    table.cell(auditTable, 0, 1, "London Long Fills", text_color = color.aqua)
+    table.cell(auditTable, 1, 1, str.tostring(londonLongFillCount), text_color = color.aqua)
+    table.cell(auditTable, 0, 2, "London Long Net", text_color = color.aqua)
+    table.cell(auditTable, 1, 2, str.tostring(londonLongNetProfit, format.mintick), text_color = color.aqua)
+    table.cell(auditTable, 0, 3, "London Short Fills", text_color = color.orange)
+    table.cell(auditTable, 1, 3, str.tostring(londonShortFillCount), text_color = color.orange)
+    table.cell(auditTable, 0, 4, "London Short Net", text_color = color.orange)
+    table.cell(auditTable, 1, 4, str.tostring(londonShortNetProfit, format.mintick), text_color = color.orange)
+    table.cell(auditTable, 0, 5, "NY Long Fills", text_color = color.lime)
+    table.cell(auditTable, 1, 5, str.tostring(nyLongFillCount), text_color = color.lime)
+    table.cell(auditTable, 0, 6, "NY Long Net", text_color = color.lime)
+    table.cell(auditTable, 1, 6, str.tostring(nyLongNetProfit, format.mintick), text_color = color.lime)
+    table.cell(auditTable, 0, 7, "NY Short Fills", text_color = color.fuchsia)
+    table.cell(auditTable, 1, 7, str.tostring(nyShortFillCount), text_color = color.fuchsia)
+    table.cell(auditTable, 0, 8, "NY Short Net", text_color = color.fuchsia)
+    table.cell(auditTable, 1, 8, str.tostring(nyShortNetProfit, format.mintick), text_color = color.fuchsia)
+    table.cell(auditTable, 0, 9, "Long Net", text_color = color.green)
+    table.cell(auditTable, 1, 9, str.tostring(longNetProfit, format.mintick), text_color = color.green)
+    table.cell(auditTable, 0, 10, "Short Net", text_color = color.red)
+    table.cell(auditTable, 1, 10, str.tostring(shortNetProfit, format.mintick), text_color = color.red)
+    table.cell(auditTable, 0, 11, "London Net", text_color = color.white)
+    table.cell(auditTable, 1, 11, str.tostring(londonNetProfit, format.mintick), text_color = color.white)
+    table.cell(auditTable, 0, 12, "NY Net", text_color = color.white)
+    table.cell(auditTable, 1, 12, str.tostring(nyNetProfit, format.mintick), text_color = color.white)
+else
+    table.clear(auditTable, 0, 0, 1, 8)
+
+alertcondition(newLongSetup, "BTC Killzone Opt5 Long Setup", "New BTC ICT Killzone Opt5 long setup")
+alertcondition(newShortSetup, "BTC Killzone Opt5 Short Setup", "New BTC ICT Killzone Opt5 short setup")
