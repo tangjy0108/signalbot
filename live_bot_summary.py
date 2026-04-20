@@ -97,6 +97,39 @@ def main() -> None:
         """
     ).fetchall()
 
+    ict_session_side = conn.execute(
+        """
+        SELECT
+            COALESCE(NULLIF(TRIM(setup_session), ''), 'Unknown') AS session,
+            side,
+            COUNT(*) AS trades,
+            SUM(CASE WHEN pnl_usdt > 0 THEN 1 ELSE 0 END) AS wins,
+            ROUND(100.0 * SUM(CASE WHEN pnl_usdt > 0 THEN 1 ELSE 0 END) / COUNT(*), 1) AS win_rate_pct,
+            ROUND(SUM(pnl_usdt), 4) AS pnl_usdt,
+            ROUND(AVG(pnl_usdt), 4) AS avg_pnl_usdt
+        FROM positions
+        WHERE status='CLOSED' AND strategy_id='ict_killzone_opt3'
+        GROUP BY COALESCE(NULLIF(TRIM(setup_session), ''), 'Unknown'), side
+        ORDER BY session, side
+        """
+    ).fetchall()
+
+    s5_side = conn.execute(
+        """
+        SELECT
+            side,
+            COUNT(*) AS trades,
+            SUM(CASE WHEN pnl_usdt > 0 THEN 1 ELSE 0 END) AS wins,
+            ROUND(100.0 * SUM(CASE WHEN pnl_usdt > 0 THEN 1 ELSE 0 END) / COUNT(*), 1) AS win_rate_pct,
+            ROUND(SUM(pnl_usdt), 4) AS pnl_usdt,
+            ROUND(AVG(pnl_usdt), 4) AS avg_pnl_usdt
+        FROM positions
+        WHERE status='CLOSED' AND strategy_id='s5'
+        GROUP BY side
+        ORDER BY side
+        """
+    ).fetchall()
+
     open_positions = conn.execute(
         """
         SELECT
@@ -116,7 +149,41 @@ def main() -> None:
         """
     ).fetchall()
 
+    overall = conn.execute(
+        """
+        SELECT
+            COUNT(*) AS trades,
+            SUM(CASE WHEN pnl_usdt > 0 THEN 1 ELSE 0 END) AS wins,
+            ROUND(COALESCE(SUM(pnl_usdt), 0), 4) AS total_pnl_usdt,
+            ROUND(COALESCE(SUM(CASE WHEN pnl_usdt < 0 THEN pnl_usdt ELSE 0 END), 0), 4) AS total_loss_usdt,
+            ROUND(COALESCE(AVG(pnl_usdt), 0), 4) AS avg_pnl_usdt
+        FROM positions
+        WHERE status='CLOSED'
+        """
+    ).fetchone()
+
+    overall_rows = []
+    if overall is not None:
+        trades = int(overall["trades"] or 0)
+        wins = int(overall["wins"] or 0)
+        win_rate = round((wins / trades * 100), 1) if trades else 0.0
+        overall_rows.append(
+            {
+                "trades": trades,
+                "wins": wins,
+                "win_rate_pct": win_rate,
+                "total_pnl_usdt": overall["total_pnl_usdt"],
+                "total_loss_usdt": overall["total_loss_usdt"],
+                "avg_pnl_usdt": overall["avg_pnl_usdt"],
+            }
+        )
+
     print(f"DB: {DB_PATH}")
+    print_rows(
+        "Overall Closed Trades",
+        ["trades", "wins", "win_rate_pct", "total_pnl_usdt", "total_loss_usdt", "avg_pnl_usdt"],
+        overall_rows,
+    )
     print_rows(
         "All Closed Trades",
         ["symbol", "strategy_id", "trades", "wins", "win_rate_pct", "pnl_usdt", "avg_pnl_usdt"],
@@ -126,6 +193,16 @@ def main() -> None:
         "Today Closed Trades",
         ["symbol", "strategy_id", "trades", "wins", "win_rate_pct", "pnl_usdt"],
         today,
+    )
+    print_rows(
+        "ICT Killzone Session x Side (Closed)",
+        ["session", "side", "trades", "wins", "win_rate_pct", "pnl_usdt", "avg_pnl_usdt"],
+        ict_session_side,
+    )
+    print_rows(
+        "S5 Side Stats (Closed)",
+        ["side", "trades", "wins", "win_rate_pct", "pnl_usdt", "avg_pnl_usdt"],
+        s5_side,
     )
     print_rows(
         "Open Positions",

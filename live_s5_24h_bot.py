@@ -1,7 +1,7 @@
 """
 Multi-strategy live paper signal bot
 ------------------------------------
-- Polls Binance spot klines (default: BTCUSDT, ETHUSDT, ADAUSDT 15m)
+- Polls spot klines from configured exchange (Binance/KuCoin)
 - Runs S5 and ICT Killzone Opt3 paper signals
 - Opens/closes simulated positions and logs to SQLite
 - Sends Telegram messages for entry/exit/heartbeat (optional)
@@ -29,7 +29,25 @@ from s5_strategy_core import combined_signals
 
 
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+KUCOIN_CANDLES_URL = "https://api.kucoin.com/api/v1/market/candles"
 LOGGER = logging.getLogger("multi_signal_bot")
+
+SUPPORTED_EXCHANGES = {"binance", "kucoin"}
+KUCOIN_INTERVAL_MAP = {
+    "1m": "1min",
+    "3m": "3min",
+    "5m": "5min",
+    "15m": "15min",
+    "30m": "30min",
+    "1h": "1hour",
+    "2h": "2hour",
+    "4h": "4hour",
+    "6h": "6hour",
+    "8h": "8hour",
+    "12h": "12hour",
+    "1d": "1day",
+    "1w": "1week",
+}
 
 S5_PARAMS = {
     "lookback": 10,
@@ -79,6 +97,7 @@ load_env_file()
 class Config:
     symbols_raw: str = os.getenv("BOT_SYMBOLS", "BTCUSDT,ETHUSDT,ADAUSDT")
     strategies_raw: str = os.getenv("BOT_STRATEGIES", "s5,ict_killzone_opt3")
+    exchange_raw: str = os.getenv("BOT_EXCHANGE", "kucoin")
     interval: str = os.getenv("BOT_INTERVAL", "15m")
     kline_limit: int = int(os.getenv("BOT_KLINE_LIMIT", "600"))
     db_path: str = os.getenv("BOT_DB_PATH", "live_s5_bot.db")
@@ -86,6 +105,8 @@ class Config:
     heartbeat_minutes: int = int(os.getenv("BOT_HEARTBEAT_MINUTES", "60"))
     log_level: str = os.getenv("BOT_LOG_LEVEL", "DEBUG")
     log_path: str = os.getenv("BOT_LOG_PATH", "live_s5_bot.log")
+    ssl_verify_raw: str = os.getenv("BOT_SSL_VERIFY", "true")
+    ca_bundle_path: str = os.getenv("BOT_CA_BUNDLE", "")
 
     # paper-trade assumptions
     notional_usdt: float = float(os.getenv("BOT_NOTIONAL_USDT", "200"))
@@ -104,6 +125,23 @@ class Config:
     def strategies(self) -> list[str]:
         enabled = [s.strip().lower() for s in self.strategies_raw.split(",") if s.strip()]
         return [s for s in enabled if s in STRATEGY_NAMES]
+
+    @property
+    def exchange(self) -> str:
+        exchange = self.exchange_raw.strip().lower()
+        return exchange if exchange in SUPPORTED_EXCHANGES else "binance"
+
+    @property
+    def ssl_verify(self) -> bool:
+        return self.ssl_verify_raw.strip().lower() not in {"0", "false", "no", "off"}
+
+    @property
+    def requests_verify(self) -> bool | str:
+        if not self.ssl_verify:
+            return False
+        if self.ca_bundle_path.strip():
+            return self.ca_bundle_path.strip()
+        return True
 
 
 def setup_logging(cfg: Config) -> None:
@@ -245,10 +283,31 @@ def log_event(conn: sqlite3.Connection, level: str, message: str) -> None:
     conn.commit()
 
 
-def fetch_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
+def to_kucoin_symbol(symbol: str) -> str:
+    if "-" in symbol:
+        return symbol.upper()
+    if symbol.endswith("USDT") and len(symbol) > 4:
+        return f"{symbol[:-4]}-USDT"
+    if symbol.endswith("USDC") and len(symbol) > 4:
+        return f"{symbol[:-4]}-USDC"
+    if symbol.endswith("BTC") and len(symbol) > 3:
+        return f"{symbol[:-3]}-BTC"
+    return symbol
+
+
+def to_kucoin_interval(interval: str) -> str:
+    key = interval.strip().lower()
+    if key not in KUCOIN_INTERVAL_MAP:
+        supported = ", ".join(sorted(KUCOIN_INTERVAL_MAP.keys()))
+        raise ValueError(f"Unsupported interval for KuCoin: {interval}. supported={supported}")
+    return KUCOIN_INTERVAL_MAP[key]
+
+
+def fetch_klines_binance(symbol: str, interval: str, limit: int, verify: bool | str = True) -> pd.DataFrame:
     r = requests.get(
         BINANCE_KLINES_URL,
         params={"symbol": symbol, "interval": interval, "limit": limit},
+        verify=verify,
         timeout=20,
     )
     r.raise_for_status()
@@ -276,6 +335,39 @@ def fetch_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
     df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
     df = df[["timestamp", "open", "high", "low", "close", "volume"]].dropna()
     return df.set_index("timestamp").sort_index()
+
+
+def fetch_klines_kucoin(symbol: str, interval: str, limit: int, verify: bool | str = True) -> pd.DataFrame:
+    kucoin_symbol = to_kucoin_symbol(symbol)
+    kucoin_interval = to_kucoin_interval(interval)
+    r = requests.get(
+        KUCOIN_CANDLES_URL,
+        params={"symbol": kucoin_symbol, "type": kucoin_interval},
+        verify=verify,
+        timeout=20,
+    )
+    r.raise_for_status()
+    payload = r.json()
+    if payload.get("code") != "200000":
+        raise ValueError(f"KuCoin API error symbol={kucoin_symbol} code={payload.get('code')} msg={payload.get('msg')}")
+
+    raw = payload.get("data", [])
+    df = pd.DataFrame(raw, columns=["open_time", "open", "close", "high", "low", "volume", "turnover"])
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["open_time"] = pd.to_numeric(df["open_time"], errors="coerce")
+    df["timestamp"] = pd.to_datetime(df["open_time"], unit="s", utc=True)
+    df = df[["timestamp", "open", "high", "low", "close", "volume"]].dropna()
+    df = df.set_index("timestamp").sort_index()
+    if limit > 0:
+        df = df.tail(limit)
+    return df
+
+
+def fetch_klines(exchange: str, symbol: str, interval: str, limit: int, verify: bool | str = True) -> pd.DataFrame:
+    if exchange == "kucoin":
+        return fetch_klines_kucoin(symbol, interval, limit, verify=verify)
+    return fetch_klines_binance(symbol, interval, limit, verify=verify)
 
 
 def get_open_position(conn: sqlite3.Connection, symbol: str, strategy_id: str) -> Optional[sqlite3.Row]:
@@ -594,6 +686,17 @@ def send_heartbeat(conn: sqlite3.Connection, cfg: Config) -> None:
         """,
         (today,),
     ).fetchall()
+    overall = conn.execute(
+        """
+        SELECT
+            COALESCE(SUM(pnl_usdt), 0) AS total_pnl,
+            COALESCE(SUM(CASE WHEN pnl_usdt < 0 THEN pnl_usdt ELSE 0 END), 0) AS total_loss,
+            COUNT(*) AS total_trades,
+            COALESCE(SUM(CASE WHEN pnl_usdt > 0 THEN 1 ELSE 0 END), 0) AS total_wins
+        FROM positions
+        WHERE status='CLOSED'
+        """
+    ).fetchone()
     open_cnt = conn.execute("SELECT COUNT(*) AS c FROM positions WHERE status='OPEN'").fetchone()["c"]
     conn.row_factory = old_factory
 
@@ -603,7 +706,13 @@ def send_heartbeat(conn: sqlite3.Connection, cfg: Config) -> None:
         f"掃描幣種: {', '.join(cfg.symbols)}",
         f"策略: {', '.join(cfg.strategies)}",
         f"目前持倉: {open_cnt}",
+        f"累計已平倉損益: {float(overall['total_pnl']):+.2f} USDT",
+        f"累計總虧損: {float(overall['total_loss']):.2f} USDT",
     ]
+    total_trades = int(overall["total_trades"])
+    total_wins = int(overall["total_wins"])
+    total_win_rate = (total_wins / total_trades * 100) if total_trades else 0.0
+    lines.append(f"累計交易: {total_trades} 筆 / 勝率 {total_win_rate:.1f}%")
     if rows:
         lines.append("今日已平倉:")
         for row in rows:
@@ -623,11 +732,16 @@ def send_heartbeat(conn: sqlite3.Connection, cfg: Config) -> None:
 def main() -> None:
     cfg = Config()
     setup_logging(cfg)
+    if cfg.requests_verify is False:
+        LOGGER.warning("SSL verify disabled for HTTPS requests (BOT_SSL_VERIFY=false)")
+    elif isinstance(cfg.requests_verify, str):
+        LOGGER.info("Using custom CA bundle: %s", cfg.requests_verify)
     conn = sqlite3.connect(cfg.db_path)
     init_db(conn)
     log_event(conn, "INFO", "bot started")
     LOGGER.info(
-        "bot started symbols=%s strategies=%s interval=%s loop=%ss db=%s telegram=%s log=%s",
+        "bot started exchange=%s symbols=%s strategies=%s interval=%s loop=%ss db=%s telegram=%s log=%s ssl_verify=%s",
+        cfg.exchange,
         ",".join(cfg.symbols),
         ",".join(cfg.strategies),
         cfg.interval,
@@ -635,10 +749,12 @@ def main() -> None:
         cfg.db_path,
         "enabled" if cfg.tg_token and cfg.tg_chat_id else "disabled",
         cfg.log_path or "terminal-only",
+        cfg.requests_verify,
     )
     send_telegram(
         cfg,
         f"❤️ Multi-strategy 機器人啟動\n"
+        f"交易所: {cfg.exchange}\n"
         f"幣種: {', '.join(cfg.symbols)}\n"
         f"策略: {', '.join(cfg.strategies)}\n"
         f"週期: {cfg.interval}\n"
@@ -651,8 +767,8 @@ def main() -> None:
         started = time.monotonic()
         try:
             for symbol in cfg.symbols:
-                LOGGER.debug("tick=%s fetching Binance klines symbol=%s", tick, symbol)
-                df = fetch_klines(symbol, cfg.interval, cfg.kline_limit)
+                LOGGER.debug("tick=%s fetching klines exchange=%s symbol=%s", tick, cfg.exchange, symbol)
+                df = fetch_klines(cfg.exchange, symbol, cfg.interval, cfg.kline_limit, verify=cfg.requests_verify)
                 if len(df) < 220:
                     LOGGER.warning("tick=%s symbol=%s not enough bars: bars=%s need>=220", tick, symbol, len(df))
                     continue
