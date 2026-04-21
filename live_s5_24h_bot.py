@@ -1,7 +1,7 @@
 """
 Multi-strategy live paper signal bot
 ------------------------------------
-- Polls spot klines from configured exchange (Binance/KuCoin)
+- Polls spot klines from configured exchange (Binance/KuCoin/Bitget)
 - Runs S5 and ICT Killzone Opt3 paper signals
 - Opens/closes simulated positions and logs to SQLite
 - Sends Telegram messages for entry/exit/heartbeat (optional)
@@ -30,9 +30,10 @@ from s5_strategy_core import combined_signals
 
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 KUCOIN_CANDLES_URL = "https://api.kucoin.com/api/v1/market/candles"
+BITGET_CANDLES_URL = "https://api.bitget.com/api/v2/spot/market/candles"
 LOGGER = logging.getLogger("multi_signal_bot")
 
-SUPPORTED_EXCHANGES = {"binance", "kucoin"}
+SUPPORTED_EXCHANGES = {"binance", "kucoin", "bitget"}
 KUCOIN_INTERVAL_MAP = {
     "1m": "1min",
     "3m": "3min",
@@ -45,6 +46,20 @@ KUCOIN_INTERVAL_MAP = {
     "6h": "6hour",
     "8h": "8hour",
     "12h": "12hour",
+    "1d": "1day",
+    "1w": "1week",
+}
+BITGET_INTERVAL_MAP = {
+    "1m": "1min",
+    "3m": "3min",
+    "5m": "5min",
+    "15m": "15min",
+    "30m": "30min",
+    "1h": "1h",
+    "2h": "2h",
+    "4h": "4h",
+    "6h": "6h",
+    "12h": "12h",
     "1d": "1day",
     "1w": "1week",
 }
@@ -97,7 +112,7 @@ load_env_file()
 class Config:
     symbols_raw: str = os.getenv("BOT_SYMBOLS", "BTCUSDT,ETHUSDT,ADAUSDT")
     strategies_raw: str = os.getenv("BOT_STRATEGIES", "s5,ict_killzone_opt3")
-    exchange_raw: str = os.getenv("BOT_EXCHANGE", "kucoin")
+    exchange_raw: str = os.getenv("BOT_EXCHANGE", "bitget")
     interval: str = os.getenv("BOT_INTERVAL", "15m")
     kline_limit: int = int(os.getenv("BOT_KLINE_LIMIT", "600"))
     db_path: str = os.getenv("BOT_DB_PATH", "live_s5_bot.db")
@@ -303,6 +318,18 @@ def to_kucoin_interval(interval: str) -> str:
     return KUCOIN_INTERVAL_MAP[key]
 
 
+def to_bitget_symbol(symbol: str) -> str:
+    return symbol.replace("-", "").upper()
+
+
+def to_bitget_interval(interval: str) -> str:
+    key = interval.strip().lower()
+    if key not in BITGET_INTERVAL_MAP:
+        supported = ", ".join(sorted(BITGET_INTERVAL_MAP.keys()))
+        raise ValueError(f"Unsupported interval for Bitget: {interval}. supported={supported}")
+    return BITGET_INTERVAL_MAP[key]
+
+
 def fetch_klines_binance(symbol: str, interval: str, limit: int, verify: bool | str = True) -> pd.DataFrame:
     r = requests.get(
         BINANCE_KLINES_URL,
@@ -364,9 +391,35 @@ def fetch_klines_kucoin(symbol: str, interval: str, limit: int, verify: bool | s
     return df
 
 
+def fetch_klines_bitget(symbol: str, interval: str, limit: int, verify: bool | str = True) -> pd.DataFrame:
+    bitget_symbol = to_bitget_symbol(symbol)
+    bitget_interval = to_bitget_interval(interval)
+    r = requests.get(
+        BITGET_CANDLES_URL,
+        params={"symbol": bitget_symbol, "granularity": bitget_interval, "limit": max(1, min(limit, 1000))},
+        verify=verify,
+        timeout=20,
+    )
+    r.raise_for_status()
+    payload = r.json()
+    if payload.get("code") != "00000":
+        raise ValueError(f"Bitget API error symbol={bitget_symbol} code={payload.get('code')} msg={payload.get('msg')}")
+
+    raw = payload.get("data", [])
+    df = pd.DataFrame(raw, columns=["open_time", "open", "high", "low", "close", "volume", "quote_volume", "usdt_volume"])
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["open_time"] = pd.to_numeric(df["open_time"], errors="coerce")
+    df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    df = df[["timestamp", "open", "high", "low", "close", "volume"]].dropna()
+    return df.set_index("timestamp").sort_index()
+
+
 def fetch_klines(exchange: str, symbol: str, interval: str, limit: int, verify: bool | str = True) -> pd.DataFrame:
     if exchange == "kucoin":
         return fetch_klines_kucoin(symbol, interval, limit, verify=verify)
+    if exchange == "bitget":
+        return fetch_klines_bitget(symbol, interval, limit, verify=verify)
     return fetch_klines_binance(symbol, interval, limit, verify=verify)
 
 
@@ -792,7 +845,13 @@ def main() -> None:
                 for strategy_id in cfg.strategies:
                     pos = get_open_position(conn, symbol, strategy_id)
                     if pos is not None:
+                        # 檢查已收盤K棒的SL/TP
                         manage_position(conn, cfg, pos, df, closed_idx, closed_ts)
+
+                    # 每20秒也檢查當前進行中K棒的即時high/low，更貼近真實觸價
+                    pos = get_open_position(conn, symbol, strategy_id)
+                    if pos is not None:
+                        manage_position(conn, cfg, pos, df, open_idx, current_open_ts)
 
                     pos = get_open_position(conn, symbol, strategy_id)
                     if pos is None:
