@@ -334,6 +334,40 @@ def to_bitget_interval(interval: str) -> str:
     return BITGET_INTERVAL_MAP[key]
 
 
+def interval_to_timedelta(interval: str) -> pd.Timedelta:
+    key = interval.strip().lower()
+    if key.endswith("m") and key[:-1].isdigit():
+        return pd.Timedelta(minutes=int(key[:-1]))
+    if key.endswith("h") and key[:-1].isdigit():
+        return pd.Timedelta(hours=int(key[:-1]))
+    if key.endswith("d") and key[:-1].isdigit():
+        return pd.Timedelta(days=int(key[:-1]))
+    if key.endswith("w") and key[:-1].isdigit():
+        return pd.Timedelta(weeks=int(key[:-1]))
+    raise ValueError(f"Unsupported BOT_INTERVAL format: {interval}")
+
+
+def resolve_bar_indices(df: pd.DataFrame, interval: str) -> tuple[int, int, datetime, datetime, bool]:
+    interval_td = interval_to_timedelta(interval)
+    last_idx = len(df) - 1
+    last_open_ts = pd.Timestamp(df.index[last_idx])
+    now_ts = pd.Timestamp.now(tz="UTC")
+    has_in_progress = now_ts < (last_open_ts + interval_td)
+
+    if has_in_progress and len(df) >= 2:
+        closed_idx = len(df) - 2
+        open_idx = len(df) - 1
+        closed_ts = df.index[closed_idx].to_pydatetime()
+        current_open_ts = df.index[open_idx].to_pydatetime()
+        return closed_idx, open_idx, closed_ts, current_open_ts, True
+
+    closed_idx = len(df) - 1
+    open_idx = len(df) - 1
+    closed_ts = df.index[closed_idx].to_pydatetime()
+    current_open_ts = (pd.Timestamp(closed_ts).tz_convert("UTC") + interval_td).to_pydatetime()
+    return closed_idx, open_idx, closed_ts, current_open_ts, False
+
+
 def fetch_klines_binance(symbol: str, interval: str, limit: int, verify: bool | str = True) -> pd.DataFrame:
     r = requests.get(
         BINANCE_KLINES_URL,
@@ -553,20 +587,11 @@ def _same_entry_bar_new_extrema(
     else:
         current_bar_ts = current_bar_ts.tz_convert("UTC")
 
-    if current_bar_ts != entry_bar_ts:
-        return True, True
+    if current_bar_ts == entry_bar_ts:
+        # Ignore SL/TP checks on the entry candle to avoid counting pre-entry extremes.
+        return False, False
 
-    entry_bar_high = pos["entry_bar_high"]
-    entry_bar_low = pos["entry_bar_low"]
-    new_low_seen = True
-    new_high_seen = True
-
-    if entry_bar_low is not None and pd.notna(entry_bar_low):
-        new_low_seen = low < float(entry_bar_low)
-    if entry_bar_high is not None and pd.notna(entry_bar_high):
-        new_high_seen = high > float(entry_bar_high)
-
-    return new_low_seen, new_high_seen
+    return True, True
 
 
 def manage_position(
@@ -692,12 +717,18 @@ def try_open_new_position(
         signal = target[0]
         direction = int(signal["direction"])
         side = "long" if direction == 1 else "short"
-        entry_raw = float(df["open"].iloc[open_idx])
+        if open_idx == closed_idx:
+            # Some exchanges only return closed candles. Enter at close to avoid backdating to the same candle open.
+            entry_raw = float(df["close"].iloc[closed_idx])
+            entry_bar_high = entry_raw
+            entry_bar_low = entry_raw
+        else:
+            entry_raw = float(df["open"].iloc[open_idx])
+            entry_bar_high = float(df["high"].iloc[open_idx])
+            entry_bar_low = float(df["low"].iloc[open_idx])
         entry_px = apply_slippage(entry_raw, direction, is_entry=True, slippage_per_side=cfg.slippage_per_side)
         stop_px = float(signal["stop"])
         tp_px = float(signal["tp"])
-        entry_bar_high = float(df["high"].iloc[open_idx])
-        entry_bar_low = float(df["low"].iloc[open_idx])
         setup_session = str(signal.get("setup_session", ""))
         setup_type = str(signal.get("setup_type", ""))
 
@@ -877,20 +908,17 @@ def main() -> None:
                     LOGGER.warning("tick=%s symbol=%s not enough bars: bars=%s need>=220", tick, symbol, len(df))
                     continue
 
-                # Binance returns the current in-progress candle as the last row.
-                closed_idx = len(df) - 2
-                open_idx = len(df) - 1
-                closed_ts = df.index[closed_idx].to_pydatetime()
-                current_open_ts = df.index[open_idx].to_pydatetime()
+                closed_idx, open_idx, closed_ts, current_open_ts, has_in_progress = resolve_bar_indices(df, cfg.interval)
                 closed_close = float(df["close"].iloc[closed_idx])
                 LOGGER.info(
-                    "alive tick=%s symbol=%s bars=%s closed_bar=%s close=%.4f current_open=%s",
+                    "alive tick=%s symbol=%s bars=%s closed_bar=%s close=%.4f current_open=%s in_progress=%s",
                     tick,
                     symbol,
                     len(df),
                     closed_ts.isoformat(),
                     closed_close,
                     current_open_ts.isoformat(),
+                    has_in_progress,
                 )
 
                 for strategy_id in cfg.strategies:
@@ -901,7 +929,7 @@ def main() -> None:
 
                     # 每20秒也檢查當前進行中K棒的即時high/low，更貼近真實觸價
                     pos = get_open_position(conn, symbol, strategy_id)
-                    if pos is not None:
+                    if pos is not None and has_in_progress:
                         manage_position(conn, cfg, pos, df, open_idx, current_open_ts)
 
                     pos = get_open_position(conn, symbol, strategy_id)
