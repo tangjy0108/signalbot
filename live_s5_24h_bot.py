@@ -232,6 +232,8 @@ def init_db(conn: sqlite3.Connection) -> None:
             signal_bar_time_utc TEXT NOT NULL,
             setup_session TEXT,
             setup_type TEXT,
+            entry_bar_high REAL,
+            entry_bar_low REAL,
             status TEXT NOT NULL,
             exit_time_utc TEXT,
             exit_price REAL,
@@ -267,6 +269,8 @@ def ensure_position_columns(conn: sqlite3.Connection) -> None:
         "strategy_name": "TEXT NOT NULL DEFAULT 'S5'",
         "setup_session": "TEXT",
         "setup_type": "TEXT",
+        "entry_bar_high": "REAL",
+        "entry_bar_low": "REAL",
     }
     for name, ddl in columns.items():
         if name not in existing:
@@ -451,13 +455,16 @@ def open_position(
     signal_bar_time: datetime,
     setup_session: str = "",
     setup_type: str = "",
+    entry_bar_high: float | None = None,
+    entry_bar_low: float | None = None,
 ) -> None:
     conn.execute(
         """
         INSERT INTO positions(
             symbol, strategy_id, strategy_name, side, entry_time_utc, entry_price,
-            stop_price, tp_price, signal_bar_time_utc, setup_session, setup_type, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')
+            stop_price, tp_price, signal_bar_time_utc, setup_session, setup_type,
+            entry_bar_high, entry_bar_low, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')
         """,
         (
             symbol,
@@ -471,6 +478,8 @@ def open_position(
             signal_bar_time.isoformat(),
             setup_session,
             setup_type,
+            float(entry_bar_high) if entry_bar_high is not None else None,
+            float(entry_bar_low) if entry_bar_low is not None else None,
         ),
     )
     conn.commit()
@@ -523,6 +532,43 @@ def valid_entry_prices(direction: int, entry_px: float, stop_px: float, tp_px: f
     return entry_px < stop_px and tp_px < entry_px
 
 
+def _same_entry_bar_new_extrema(
+    pos: sqlite3.Row,
+    bar_ts: datetime,
+    low: float,
+    high: float,
+) -> tuple[bool, bool]:
+    entry_bar_raw = pos["entry_time_utc"]
+    if not entry_bar_raw:
+        return True, True
+
+    entry_bar_ts = pd.Timestamp(entry_bar_raw)
+    current_bar_ts = pd.Timestamp(bar_ts)
+    if entry_bar_ts.tzinfo is None:
+        entry_bar_ts = entry_bar_ts.tz_localize("UTC")
+    else:
+        entry_bar_ts = entry_bar_ts.tz_convert("UTC")
+    if current_bar_ts.tzinfo is None:
+        current_bar_ts = current_bar_ts.tz_localize("UTC")
+    else:
+        current_bar_ts = current_bar_ts.tz_convert("UTC")
+
+    if current_bar_ts != entry_bar_ts:
+        return True, True
+
+    entry_bar_high = pos["entry_bar_high"]
+    entry_bar_low = pos["entry_bar_low"]
+    new_low_seen = True
+    new_high_seen = True
+
+    if entry_bar_low is not None and pd.notna(entry_bar_low):
+        new_low_seen = low < float(entry_bar_low)
+    if entry_bar_high is not None and pd.notna(entry_bar_high):
+        new_high_seen = high > float(entry_bar_high)
+
+    return new_low_seen, new_high_seen
+
+
 def manage_position(
     conn: sqlite3.Connection,
     cfg: Config,
@@ -557,9 +603,10 @@ def manage_position(
 
     raw_exit = None
     reason = None
+    new_low_seen, new_high_seen = _same_entry_bar_new_extrema(pos, closed_ts, low, high)
     if side == "long":
-        hit_sl = low <= stop_px
-        hit_tp = high >= tp_px
+        hit_sl = new_low_seen and low <= stop_px
+        hit_tp = new_high_seen and high >= tp_px
         if hit_sl and hit_tp:
             raw_exit, reason = stop_px, "both_hit_stop_first"
         elif hit_sl:
@@ -567,8 +614,8 @@ def manage_position(
         elif hit_tp:
             raw_exit, reason = tp_px, "tp"
     else:
-        hit_sl = high >= stop_px
-        hit_tp = low <= tp_px
+        hit_sl = new_high_seen and high >= stop_px
+        hit_tp = new_low_seen and low <= tp_px
         if hit_sl and hit_tp:
             raw_exit, reason = stop_px, "both_hit_stop_first"
         elif hit_sl:
@@ -649,6 +696,8 @@ def try_open_new_position(
         entry_px = apply_slippage(entry_raw, direction, is_entry=True, slippage_per_side=cfg.slippage_per_side)
         stop_px = float(signal["stop"])
         tp_px = float(signal["tp"])
+        entry_bar_high = float(df["high"].iloc[open_idx])
+        entry_bar_low = float(df["low"].iloc[open_idx])
         setup_session = str(signal.get("setup_session", ""))
         setup_type = str(signal.get("setup_type", ""))
 
@@ -677,6 +726,8 @@ def try_open_new_position(
                 signal_bar_time=closed_ts,
                 setup_session=setup_session,
                 setup_type=setup_type,
+                entry_bar_high=entry_bar_high,
+                entry_bar_low=entry_bar_low,
             )
             msg = (
                 f"✅ 開倉成功\n"
