@@ -587,8 +587,8 @@ def _same_entry_bar_new_extrema(
     else:
         current_bar_ts = current_bar_ts.tz_convert("UTC")
 
-    if current_bar_ts == entry_bar_ts:
-        # Ignore SL/TP checks on the entry candle to avoid counting pre-entry extremes.
+    if current_bar_ts <= entry_bar_ts:
+        # Ignore candles at/before entry time to avoid using pre-entry or entry-candle extremes.
         return False, False
 
     return True, True
