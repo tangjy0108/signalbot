@@ -77,7 +77,23 @@ S5_PARAMS = {
 STRATEGY_NAMES = {
     "s5": "S5 (BOS+FVG+RSI, RR=1.5)",
     "ict_killzone_opt3": "ICT Killzone Opt3",
+    "edge_ny_vol_long": "EDGE NY Vol Expand Long",
+    "edge_breakdown_vol_short": "EDGE Breakdown+Vol Short",
 }
+
+EDGE_PARAMS = {
+    "atr_period": 14,
+    "vol_ma_period": 20,
+    "vol_expand_ratio": 1.2,
+    "atr_mult_sl": 1.2,
+    "rr_ratio": 2.0,
+}
+
+
+def strategy_interval(strategy_id: str) -> str:
+    if strategy_id in {"edge_ny_vol_long", "edge_breakdown_vol_short"}:
+        return "1h"
+    return "15m"
 
 
 def load_env_file(path: Optional[str] = None) -> None:
@@ -127,6 +143,7 @@ class Config:
     notional_usdt: float = float(os.getenv("BOT_NOTIONAL_USDT", "200"))
     fee_per_side: float = float(os.getenv("BOT_FEE_PER_SIDE", "0.0004"))
     slippage_per_side: float = float(os.getenv("BOT_SLIPPAGE_PER_SIDE", "0.0002"))
+    reentry_cooldown_bars: int = int(os.getenv("BOT_REENTRY_COOLDOWN_BARS", "2"))
 
     # optional Telegram
     tg_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -292,6 +309,43 @@ def db_set(conn: sqlite3.Connection, key: str, value: str) -> None:
 
 def state_key(strategy_id: str, symbol: str, key: str) -> str:
     return f"{strategy_id}:{symbol}:{key}"
+
+
+def should_block_same_side_reentry(
+    conn: sqlite3.Connection,
+    cfg: Config,
+    symbol: str,
+    strategy_id: str,
+    interval: str,
+    new_side: str,
+    closed_ts: datetime,
+) -> bool:
+    if cfg.reentry_cooldown_bars <= 0:
+        return False
+
+    last_exit_side = db_get(conn, state_key(strategy_id, symbol, "last_exit_side"), "")
+    last_exit_ts_raw = db_get(conn, state_key(strategy_id, symbol, "last_exit_time_utc"), "")
+    if not last_exit_side or not last_exit_ts_raw:
+        return False
+    if last_exit_side != new_side:
+        return False
+
+    try:
+        last_exit_ts = pd.Timestamp(last_exit_ts_raw)
+        curr_closed_ts = pd.Timestamp(closed_ts)
+        if last_exit_ts.tzinfo is None:
+            last_exit_ts = last_exit_ts.tz_localize("UTC")
+        else:
+            last_exit_ts = last_exit_ts.tz_convert("UTC")
+        if curr_closed_ts.tzinfo is None:
+            curr_closed_ts = curr_closed_ts.tz_localize("UTC")
+        else:
+            curr_closed_ts = curr_closed_ts.tz_convert("UTC")
+
+        min_wait = interval_to_timedelta(interval) * cfg.reentry_cooldown_bars
+        return curr_closed_ts < (last_exit_ts + min_wait)
+    except Exception:
+        return False
 
 
 def log_event(conn: sqlite3.Connection, level: str, message: str) -> None:
@@ -555,7 +609,75 @@ def strategy_signals(strategy_id: str, df: pd.DataFrame) -> list[dict[str, Any]]
         return signals
     if strategy_id == "ict_killzone_opt3":
         return killzone_opt3_signals(df, KILLZONE_PARAMS)
+    if strategy_id in {"edge_ny_vol_long", "edge_breakdown_vol_short"}:
+        return edge_strategy_signals(strategy_id, df)
     return []
+
+
+def _compute_atr(df: pd.DataFrame, period: int) -> pd.Series:
+    h, l, c = df["high"], df["low"], df["close"]
+    prev_c = c.shift(1)
+    tr = pd.concat([h - l, (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
+    return tr.ewm(span=period, adjust=False).mean()
+
+
+def edge_strategy_signals(strategy_id: str, df: pd.DataFrame) -> list[dict[str, Any]]:
+    atr = _compute_atr(df, EDGE_PARAMS["atr_period"])
+    vol_ma = df["volume"].rolling(EDGE_PARAMS["vol_ma_period"]).mean()
+    vol_expand = df["volume"] > (vol_ma * EDGE_PARAMS["vol_expand_ratio"])
+
+    ll20_prev_series = df["low"].shift(1).rolling(20).min()
+    signals: list[dict[str, Any]] = []
+    n = len(df)
+    if n < 60:
+        return signals
+
+    for i in range(30, n - 1):
+        if pd.isna(atr.iloc[i]) or atr.iloc[i] <= 0 or pd.isna(vol_ma.iloc[i]):
+            continue
+
+        close_i = float(df["close"].iloc[i])
+        ts = pd.Timestamp(df.index[i])
+        hour = ts.tz_convert("UTC").hour if ts.tzinfo is not None else ts.hour
+
+        if strategy_id == "edge_ny_vol_long":
+            # Edge pattern: NY session + volume expansion (found robust on ETH/ADA)
+            if (17 <= hour <= 21) and bool(vol_expand.iloc[i]):
+                stop = close_i - EDGE_PARAMS["atr_mult_sl"] * float(atr.iloc[i])
+                risk = close_i - stop
+                if risk > 0:
+                    signals.append(
+                        {
+                            "bar": i + 1,
+                            "direction": 1,
+                            "entry": close_i,
+                            "stop": stop,
+                            "tp": close_i + EDGE_PARAMS["rr_ratio"] * risk,
+                            "setup_session": "ny",
+                            "setup_type": "vol_expand",
+                        }
+                    )
+
+        elif strategy_id == "edge_breakdown_vol_short":
+            # Edge pattern: breakdown of previous 20-bar low + volume expansion
+            ll20_prev = ll20_prev_series.iloc[i]
+            if pd.notna(ll20_prev) and close_i < float(ll20_prev) and bool(vol_expand.iloc[i]):
+                stop = close_i + EDGE_PARAMS["atr_mult_sl"] * float(atr.iloc[i])
+                risk = stop - close_i
+                if risk > 0:
+                    signals.append(
+                        {
+                            "bar": i + 1,
+                            "direction": -1,
+                            "entry": close_i,
+                            "stop": stop,
+                            "tp": close_i - EDGE_PARAMS["rr_ratio"] * risk,
+                            "setup_session": "",
+                            "setup_type": "breakdown_vol",
+                        }
+                    )
+
+    return signals
 
 
 def valid_entry_prices(direction: int, entry_px: float, stop_px: float, tp_px: float) -> bool:
@@ -659,6 +781,8 @@ def manage_position(
     direction = 1 if side == "long" else -1
     exit_px = apply_slippage(raw_exit, direction, is_entry=False, slippage_per_side=cfg.slippage_per_side)
     pnl = close_position(conn, cfg, int(pos["id"]), side, entry_px, exit_px, reason)
+    db_set(conn, state_key(strategy_id, symbol, "last_exit_side"), side)
+    db_set(conn, state_key(strategy_id, symbol, "last_exit_time_utc"), closed_ts.replace(tzinfo=timezone.utc).isoformat())
     LOGGER.info(
         "position closed symbol=%s strategy=%s id=%s reason=%s exit=%.4f pnl=%+.2f",
         symbol,
@@ -693,6 +817,7 @@ def try_open_new_position(
     open_idx: int,
     closed_ts: datetime,
     current_open_ts: datetime,
+    interval: str,
 ) -> None:
     strategy_name = STRATEGY_NAMES[strategy_id]
     key = state_key(strategy_id, symbol, "last_signal_bar_utc")
@@ -731,6 +856,19 @@ def try_open_new_position(
         tp_px = float(signal["tp"])
         setup_session = str(signal.get("setup_session", ""))
         setup_type = str(signal.get("setup_type", ""))
+
+        if should_block_same_side_reentry(conn, cfg, symbol, strategy_id, interval, side, closed_ts):
+            LOGGER.info(
+                "reentry cooldown skip symbol=%s strategy=%s interval=%s side=%s closed_bar=%s cooldown_bars=%s",
+                symbol,
+                strategy_id,
+                interval,
+                side,
+                closed_ts_iso,
+                cfg.reentry_cooldown_bars,
+            )
+            db_set(conn, key, closed_ts_iso)
+            return
 
         if valid_entry_prices(direction, entry_px, stop_px, tp_px):
             LOGGER.info(
@@ -867,6 +1005,10 @@ def send_heartbeat(conn: sqlite3.Connection, cfg: Config) -> None:
 def main() -> None:
     cfg = Config()
     setup_logging(cfg)
+    strategy_intervals = {sid: strategy_interval(sid) for sid in cfg.strategies}
+    unique_intervals = sorted(set(strategy_intervals.values()))
+    if cfg.interval != "15m":
+        LOGGER.info("BOT_INTERVAL=%s ignored; using per-strategy intervals (legacy=15m, edge=1h)", cfg.interval)
     if cfg.requests_verify is False:
         LOGGER.warning("SSL verify disabled for HTTPS requests (BOT_SSL_VERIFY=false)")
     elif isinstance(cfg.requests_verify, str):
@@ -875,11 +1017,11 @@ def main() -> None:
     init_db(conn)
     log_event(conn, "INFO", "bot started")
     LOGGER.info(
-        "bot started exchange=%s symbols=%s strategies=%s interval=%s loop=%ss db=%s telegram=%s log=%s ssl_verify=%s",
+        "bot started exchange=%s symbols=%s strategies=%s intervals=%s loop=%ss db=%s telegram=%s log=%s ssl_verify=%s",
         cfg.exchange,
         ",".join(cfg.symbols),
         ",".join(cfg.strategies),
-        cfg.interval,
+        ",".join(unique_intervals),
         cfg.loop_seconds,
         cfg.db_path,
         "enabled" if cfg.tg_token and cfg.tg_chat_id else "disabled",
@@ -892,7 +1034,7 @@ def main() -> None:
         f"交易所: {cfg.exchange}\n"
         f"幣種: {', '.join(cfg.symbols)}\n"
         f"策略: {', '.join(cfg.strategies)}\n"
-        f"週期: {cfg.interval}\n"
+        f"週期: legacy=15m, edge=1h\n"
         f"時間: {fmt_ts(now_utc())}",
     )
 
@@ -902,32 +1044,41 @@ def main() -> None:
         started = time.monotonic()
         try:
             for symbol in cfg.symbols:
-                LOGGER.debug("tick=%s fetching klines exchange=%s symbol=%s", tick, cfg.exchange, symbol)
-                df = fetch_klines(cfg.exchange, symbol, cfg.interval, cfg.kline_limit, verify=cfg.requests_verify)
-                if len(df) < 220:
-                    LOGGER.warning("tick=%s symbol=%s not enough bars: bars=%s need>=220", tick, symbol, len(df))
-                    continue
-
-                closed_idx, open_idx, closed_ts, current_open_ts, has_in_progress = resolve_bar_indices(df, cfg.interval)
-                closed_close = float(df["close"].iloc[closed_idx])
-                LOGGER.info(
-                    "alive tick=%s symbol=%s bars=%s closed_bar=%s close=%.4f current_open=%s in_progress=%s",
-                    tick,
-                    symbol,
-                    len(df),
-                    closed_ts.isoformat(),
-                    closed_close,
-                    current_open_ts.isoformat(),
-                    has_in_progress,
-                )
+                interval_dfs: dict[str, pd.DataFrame] = {}
+                for interval in unique_intervals:
+                    LOGGER.debug("tick=%s fetching klines exchange=%s symbol=%s interval=%s", tick, cfg.exchange, symbol, interval)
+                    df_i = fetch_klines(cfg.exchange, symbol, interval, cfg.kline_limit, verify=cfg.requests_verify)
+                    if len(df_i) < 220:
+                        LOGGER.warning("tick=%s symbol=%s interval=%s not enough bars: bars=%s need>=220", tick, symbol, interval, len(df_i))
+                        continue
+                    interval_dfs[interval] = df_i
 
                 for strategy_id in cfg.strategies:
+                    interval = strategy_intervals[strategy_id]
+                    df = interval_dfs.get(interval)
+                    if df is None:
+                        LOGGER.debug("skip strategy due to missing bars symbol=%s strategy=%s interval=%s", symbol, strategy_id, interval)
+                        continue
+
+                    closed_idx, open_idx, closed_ts, current_open_ts, has_in_progress = resolve_bar_indices(df, interval)
+                    closed_close = float(df["close"].iloc[closed_idx])
+                    LOGGER.info(
+                        "alive tick=%s symbol=%s strategy=%s interval=%s bars=%s closed_bar=%s close=%.4f current_open=%s in_progress=%s",
+                        tick,
+                        symbol,
+                        strategy_id,
+                        interval,
+                        len(df),
+                        closed_ts.isoformat(),
+                        closed_close,
+                        current_open_ts.isoformat(),
+                        has_in_progress,
+                    )
+
                     pos = get_open_position(conn, symbol, strategy_id)
                     if pos is not None:
-                        # 檢查已收盤K棒的SL/TP
                         manage_position(conn, cfg, pos, df, closed_idx, closed_ts)
 
-                    # 每20秒也檢查當前進行中K棒的即時high/low，更貼近真實觸價
                     pos = get_open_position(conn, symbol, strategy_id)
                     if pos is not None and has_in_progress:
                         manage_position(conn, cfg, pos, df, open_idx, current_open_ts)
@@ -944,9 +1095,10 @@ def main() -> None:
                             open_idx=open_idx,
                             closed_ts=closed_ts,
                             current_open_ts=current_open_ts,
+                            interval=interval,
                         )
                     else:
-                        LOGGER.debug("skip signal check: open position symbol=%s strategy=%s", symbol, strategy_id)
+                        LOGGER.debug("skip signal check: open position symbol=%s strategy=%s interval=%s", symbol, strategy_id, interval)
 
             send_heartbeat(conn, cfg)
 
