@@ -638,10 +638,10 @@ def edge_strategy_signals(strategy_id: str, df: pd.DataFrame) -> list[dict[str, 
 
         close_i = float(df["close"].iloc[i])
         ts = pd.Timestamp(df.index[i])
-        hour = ts.tz_convert("UTC").hour if ts.tzinfo is not None else ts.hour
+        hour = ts.tz_convert("America/New_York").hour if ts.tzinfo is not None else ts.hour
 
         if strategy_id == "edge_ny_vol_long":
-            # Edge pattern: NY session + volume expansion (found robust on ETH/ADA)
+            # Edge pattern: NY session (17-21 NYC time) + volume expansion (found robust on ETH/ADA)
             if (17 <= hour <= 21) and bool(vol_expand.iloc[i]):
                 stop = close_i - EDGE_PARAMS["atr_mult_sl"] * float(atr.iloc[i])
                 risk = close_i - stop
