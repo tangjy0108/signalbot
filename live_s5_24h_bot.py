@@ -2,7 +2,7 @@
 S5 24h signal bot (paper-trade style)
 -------------------------------------
 - Polls Binance spot klines (default: BTCUSDT 15m)
-- Uses s5_strategy_core.py::combined_signals with S5 params (rr=1.5)
+- Uses research.py::combined_signals with S5 params (rr=1.5)
 - Opens/closes a simulated position and logs to SQLite
 - Sends Telegram messages for entry/exit/heartbeat (optional)
 
@@ -12,27 +12,18 @@ This script does NOT place real exchange orders.
 from __future__ import annotations
 
 import os
-import sys
 import time
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Optional
-from pathlib import Path
 
 import pandas as pd
 import requests
 
-# Add current directory to path so imports work from any location
-script_dir = Path(__file__).resolve().parent
-sys.path.insert(0, str(script_dir))
-
-try:
-    from s5_strategy_core import combined_signals
-except ImportError as e:
-    print(f"[ERROR] Failed to import s5_strategy_core: {e}", file=sys.stderr)
-    raise
+from research import combined_signals
+from live_practical_session_report import apply_slippage
 
 
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
@@ -65,29 +56,6 @@ class Config:
     # optional Telegram
     tg_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     tg_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
-
-
-def apply_slippage(price: float, direction: int, is_entry: bool, slippage_per_side: float) -> float:
-    """Apply slippage to price based on direction and entry/exit.
-    
-    Args:
-        price: Base price
-        direction: 1 for long, -1 for short
-        is_entry: True for entry, False for exit
-        slippage_per_side: Slippage as decimal (e.g., 0.0002 for 2 bps)
-    
-    Returns:
-        Price with slippage applied
-    """
-    # long: pay up on entry, sell lower on exit
-    # short: sell lower on entry, buy higher on exit
-    if direction == 1 and is_entry:
-        return price * (1 + slippage_per_side)
-    if direction == 1 and not is_entry:
-        return price * (1 - slippage_per_side)
-    if direction == -1 and is_entry:
-        return price * (1 - slippage_per_side)
-    return price * (1 + slippage_per_side)
 
 
 def now_utc() -> datetime:
@@ -324,7 +292,7 @@ def main():
 
                 if raw_exit is not None:
                     direction = 1 if side == "long" else -1
-                    exit_px = apply_slippage(raw_exit, direction, is_entry=False, slippage_per_side=cfg.slippage_per_side)
+                    exit_px = apply_slippage(raw_exit, direction, is_entry=False)
                     pnl = close_position(conn, cfg, int(pos["id"]), side, entry_px, exit_px, reason)
                     msg = (
                         f"💰 平倉\n"
@@ -352,7 +320,7 @@ def main():
                     direction = int(s["direction"])
                     side = "long" if direction == 1 else "short"
                     entry_raw = float(df["open"].iloc[open_idx])
-                    entry_px = apply_slippage(entry_raw, direction, is_entry=True, slippage_per_side=cfg.slippage_per_side)
+                    entry_px = apply_slippage(entry_raw, direction, is_entry=True)
                     stop_px = float(s["stop"])
                     tp_px = float(s["tp"])
 
