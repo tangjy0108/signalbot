@@ -19,15 +19,28 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Optional
+from pathlib import Path
 
 import pandas as pd
 import requests
 
 # Add current directory to path so imports work from any location
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+script_dir = Path(__file__).resolve().parent
+sys.path.insert(0, str(script_dir))
 
-from research import combined_signals
-from live_practical_session_report import apply_slippage
+# Debug: print what we're adding to path
+print(f"[DEBUG] Added to sys.path: {script_dir}", file=sys.stderr)
+print(f"[DEBUG] research.py exists: {(script_dir / 'research.py').exists()}", file=sys.stderr)
+print(f"[DEBUG] live_practical_session_report.py exists: {(script_dir / 'live_practical_session_report.py').exists()}", file=sys.stderr)
+
+try:
+    from research import combined_signals
+    from live_practical_session_report import apply_slippage
+except ImportError as e:
+    print(f"[ERROR] 无法导入必要模块: {e}", file=sys.stderr)
+    print(f"[ERROR] sys.path: {sys.path}", file=sys.stderr)
+    print(f"[ERROR] 目录内容: {list(script_dir.glob('*.py'))}", file=sys.stderr)
+    raise
 
 
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
