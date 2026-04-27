@@ -28,18 +28,10 @@ import requests
 script_dir = Path(__file__).resolve().parent
 sys.path.insert(0, str(script_dir))
 
-# Debug: print what we're adding to path
-print(f"[DEBUG] Added to sys.path: {script_dir}", file=sys.stderr)
-print(f"[DEBUG] research.py exists: {(script_dir / 'research.py').exists()}", file=sys.stderr)
-print(f"[DEBUG] live_practical_session_report.py exists: {(script_dir / 'live_practical_session_report.py').exists()}", file=sys.stderr)
-
 try:
     from s5_strategy_core import combined_signals
-    from live_practical_session_report import apply_slippage
 except ImportError as e:
-    print(f"[ERROR] 无法导入必要模块: {e}", file=sys.stderr)
-    print(f"[ERROR] sys.path: {sys.path}", file=sys.stderr)
-    print(f"[ERROR] 目录内容: {list(script_dir.glob('*.py'))}", file=sys.stderr)
+    print(f"[ERROR] Failed to import s5_strategy_core: {e}", file=sys.stderr)
     raise
 
 
@@ -73,6 +65,29 @@ class Config:
     # optional Telegram
     tg_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     tg_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
+
+
+def apply_slippage(price: float, direction: int, is_entry: bool, slippage_per_side: float) -> float:
+    """Apply slippage to price based on direction and entry/exit.
+    
+    Args:
+        price: Base price
+        direction: 1 for long, -1 for short
+        is_entry: True for entry, False for exit
+        slippage_per_side: Slippage as decimal (e.g., 0.0002 for 2 bps)
+    
+    Returns:
+        Price with slippage applied
+    """
+    # long: pay up on entry, sell lower on exit
+    # short: sell lower on entry, buy higher on exit
+    if direction == 1 and is_entry:
+        return price * (1 + slippage_per_side)
+    if direction == 1 and not is_entry:
+        return price * (1 - slippage_per_side)
+    if direction == -1 and is_entry:
+        return price * (1 - slippage_per_side)
+    return price * (1 + slippage_per_side)
 
 
 def now_utc() -> datetime:
@@ -309,7 +324,7 @@ def main():
 
                 if raw_exit is not None:
                     direction = 1 if side == "long" else -1
-                    exit_px = apply_slippage(raw_exit, direction, is_entry=False)
+                    exit_px = apply_slippage(raw_exit, direction, is_entry=False, slippage_per_side=cfg.slippage_per_side)
                     pnl = close_position(conn, cfg, int(pos["id"]), side, entry_px, exit_px, reason)
                     msg = (
                         f"💰 平倉\n"
@@ -337,7 +352,7 @@ def main():
                     direction = int(s["direction"])
                     side = "long" if direction == 1 else "short"
                     entry_raw = float(df["open"].iloc[open_idx])
-                    entry_px = apply_slippage(entry_raw, direction, is_entry=True)
+                    entry_px = apply_slippage(entry_raw, direction, is_entry=True, slippage_per_side=cfg.slippage_per_side)
                     stop_px = float(s["stop"])
                     tp_px = float(s["tp"])
 
