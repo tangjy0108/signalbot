@@ -1,9 +1,9 @@
 """
-Multi-strategy live paper signal bot
-------------------------------------
-- Polls spot klines from configured exchange (Binance/KuCoin/Bitget)
-- Runs S5 and ICT Killzone Opt3 paper signals
-- Opens/closes simulated positions and logs to SQLite
+S5 24h signal bot (paper-trade style)
+-------------------------------------
+- Polls Binance spot klines (default: BTCUSDT 15m)
+- Uses research.py::combined_signals with S5 params (rr=1.5)
+- Opens/closes a simulated position and logs to SQLite
 - Sends Telegram messages for entry/exit/heartbeat (optional)
 
 This script does NOT place real exchange orders.
@@ -11,58 +11,22 @@ This script does NOT place real exchange orders.
 
 from __future__ import annotations
 
-import logging
 import os
-import sqlite3
 import time
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional
 from zoneinfo import ZoneInfo
+from typing import Optional
 
 import pandas as pd
 import requests
 
-from ict_killzone_opt3_core import DEFAULT_PARAMS as KILLZONE_PARAMS
-from ict_killzone_opt3_core import killzone_opt3_signals, should_force_flat_after_ny
-from s5_strategy_core import combined_signals
+from research import combined_signals
+from live_practical_session_report import apply_slippage
 
 
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
-KUCOIN_CANDLES_URL = "https://api.kucoin.com/api/v1/market/candles"
-BITGET_CANDLES_URL = "https://api.bitget.com/api/v2/spot/market/candles"
-LOGGER = logging.getLogger("multi_signal_bot")
-
-SUPPORTED_EXCHANGES = {"binance", "kucoin", "bitget"}
-KUCOIN_INTERVAL_MAP = {
-    "1m": "1min",
-    "3m": "3min",
-    "5m": "5min",
-    "15m": "15min",
-    "30m": "30min",
-    "1h": "1hour",
-    "2h": "2hour",
-    "4h": "4hour",
-    "6h": "6hour",
-    "8h": "8hour",
-    "12h": "12hour",
-    "1d": "1day",
-    "1w": "1week",
-}
-BITGET_INTERVAL_MAP = {
-    "1m": "1min",
-    "3m": "3min",
-    "5m": "5min",
-    "15m": "15min",
-    "30m": "30min",
-    "1h": "1h",
-    "2h": "2h",
-    "4h": "4h",
-    "6h": "6h",
-    "12h": "12h",
-    "1d": "1day",
-    "1w": "1week",
-}
 
 S5_PARAMS = {
     "lookback": 10,
@@ -71,122 +35,27 @@ S5_PARAMS = {
     "rsi_ob": 65,
     "rsi_os": 35,
     "atr_mult_sl": 1.0,
-    "rr_ratio": 1.5,
+    "rr_ratio": 1.5,  # best balance from current RR sweep
 }
-
-STRATEGY_NAMES = {
-    "s5": "S5 (BOS+FVG+RSI, RR=1.5)",
-    "ict_killzone_opt3": "ICT Killzone Opt3",
-    "edge_ny_vol_long": "EDGE NY Vol Expand Long",
-    "edge_breakdown_vol_short": "EDGE Breakdown+Vol Short",
-}
-
-EDGE_PARAMS = {
-    "atr_period": 14,
-    "vol_ma_period": 20,
-    "vol_expand_ratio": 1.2,
-    "atr_mult_sl": 1.2,
-    "rr_ratio": 2.0,
-}
-
-
-def strategy_interval(strategy_id: str) -> str:
-    if strategy_id in {"edge_ny_vol_long", "edge_breakdown_vol_short"}:
-        return "1h"
-    return "15m"
-
-
-def load_env_file(path: Optional[str] = None) -> None:
-    env_path = path or os.getenv("BOT_ENV_PATH", ".env")
-    if not env_path:
-        return
-
-    try:
-        with open(env_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-    except FileNotFoundError:
-        return
-
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        if not key or key in os.environ:
-            continue
-        value = value.strip()
-        if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
-            value = value[1:-1]
-        os.environ[key] = value
-
-
-load_env_file()
 
 
 @dataclass
 class Config:
-    symbols_raw: str = os.getenv("BOT_SYMBOLS", "BTCUSDT,ETHUSDT,ADAUSDT")
-    strategies_raw: str = os.getenv("BOT_STRATEGIES", "s5,ict_killzone_opt3")
-    exchange_raw: str = os.getenv("BOT_EXCHANGE", "bitget")
+    symbol: str = os.getenv("BOT_SYMBOL", "BTCUSDT")
     interval: str = os.getenv("BOT_INTERVAL", "15m")
     kline_limit: int = int(os.getenv("BOT_KLINE_LIMIT", "600"))
     db_path: str = os.getenv("BOT_DB_PATH", "live_s5_bot.db")
     loop_seconds: int = int(os.getenv("BOT_LOOP_SECONDS", "20"))
     heartbeat_minutes: int = int(os.getenv("BOT_HEARTBEAT_MINUTES", "60"))
-    log_level: str = os.getenv("BOT_LOG_LEVEL", "DEBUG")
-    log_path: str = os.getenv("BOT_LOG_PATH", "live_s5_bot.log")
-    ssl_verify_raw: str = os.getenv("BOT_SSL_VERIFY", "true")
-    ca_bundle_path: str = os.getenv("BOT_CA_BUNDLE", "")
 
     # paper-trade assumptions
     notional_usdt: float = float(os.getenv("BOT_NOTIONAL_USDT", "200"))
     fee_per_side: float = float(os.getenv("BOT_FEE_PER_SIDE", "0.0004"))
     slippage_per_side: float = float(os.getenv("BOT_SLIPPAGE_PER_SIDE", "0.0002"))
-    reentry_cooldown_bars: int = int(os.getenv("BOT_REENTRY_COOLDOWN_BARS", "2"))
 
     # optional Telegram
     tg_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     tg_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
-
-    @property
-    def symbols(self) -> list[str]:
-        return [s.strip().upper() for s in self.symbols_raw.split(",") if s.strip()]
-
-    @property
-    def strategies(self) -> list[str]:
-        enabled = [s.strip().lower() for s in self.strategies_raw.split(",") if s.strip()]
-        return [s for s in enabled if s in STRATEGY_NAMES]
-
-    @property
-    def exchange(self) -> str:
-        exchange = self.exchange_raw.strip().lower()
-        return exchange if exchange in SUPPORTED_EXCHANGES else "binance"
-
-    @property
-    def ssl_verify(self) -> bool:
-        return self.ssl_verify_raw.strip().lower() not in {"0", "false", "no", "off"}
-
-    @property
-    def requests_verify(self) -> bool | str:
-        if not self.ssl_verify:
-            return False
-        if self.ca_bundle_path.strip():
-            return self.ca_bundle_path.strip()
-        return True
-
-
-def setup_logging(cfg: Config) -> None:
-    level = getattr(logging, cfg.log_level.upper(), logging.DEBUG)
-    fmt = "%(asctime)s %(levelname)s %(message)s"
-    handlers: list[logging.Handler] = [logging.StreamHandler()]
-    if cfg.log_path:
-        handlers.append(logging.FileHandler(cfg.log_path, encoding="utf-8"))
-    logging.basicConfig(level=level, format=fmt, handlers=handlers, force=True)
-    # Keep bot debug logs, but do not print full third-party HTTP URLs.
-    # Telegram tokens are embedded in bot API URLs, so urllib3 DEBUG logs are sensitive.
-    logging.getLogger("urllib3").setLevel(logging.WARNING)
-    logging.getLogger("requests").setLevel(logging.WARNING)
 
 
 def now_utc() -> datetime:
@@ -200,29 +69,13 @@ def fmt_ts(dt: datetime) -> str:
 
 def send_telegram(cfg: Config, msg: str) -> None:
     if not cfg.tg_token or not cfg.tg_chat_id:
-        LOGGER.debug("telegram skipped: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set")
         return
     try:
         url = f"https://api.telegram.org/bot{cfg.tg_token}/sendMessage"
-        res = requests.post(url, json={"chat_id": cfg.tg_chat_id, "text": msg}, timeout=15)
-        if res.ok:
-            LOGGER.debug("telegram sent")
-        else:
-            LOGGER.warning("telegram send failed: status=%s", res.status_code)
-    except Exception as exc:
-        LOGGER.warning("telegram send failed: %s", type(exc).__name__)
-
-
-def apply_slippage(price: float, direction: int, is_entry: bool, slippage_per_side: float) -> float:
-    # long: pay up on entry, sell lower on exit
-    # short: sell lower on entry, buy higher on exit
-    if direction == 1 and is_entry:
-        return price * (1 + slippage_per_side)
-    if direction == 1 and not is_entry:
-        return price * (1 - slippage_per_side)
-    if direction == -1 and is_entry:
-        return price * (1 - slippage_per_side)
-    return price * (1 + slippage_per_side)
+        requests.post(url, json={"chat_id": cfg.tg_chat_id, "text": msg}, timeout=15)
+    except Exception:
+        # keep bot running even if notify fails
+        pass
 
 
 def init_db(conn: sqlite3.Connection) -> None:
@@ -239,18 +92,12 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS positions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             symbol TEXT NOT NULL,
-            strategy_id TEXT NOT NULL DEFAULT 's5',
-            strategy_name TEXT NOT NULL DEFAULT 'S5',
             side TEXT NOT NULL,
             entry_time_utc TEXT NOT NULL,
             entry_price REAL NOT NULL,
             stop_price REAL NOT NULL,
             tp_price REAL NOT NULL,
             signal_bar_time_utc TEXT NOT NULL,
-            setup_session TEXT,
-            setup_type TEXT,
-            entry_bar_high REAL,
-            entry_bar_low REAL,
             status TEXT NOT NULL,
             exit_time_utc TEXT,
             exit_price REAL,
@@ -269,29 +116,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
         """
     )
-    ensure_position_columns(conn)
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_positions_open_strategy_symbol
-        ON positions(status, strategy_id, symbol)
-        """
-    )
     conn.commit()
-
-
-def ensure_position_columns(conn: sqlite3.Connection) -> None:
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(positions)").fetchall()}
-    columns = {
-        "strategy_id": "TEXT NOT NULL DEFAULT 's5'",
-        "strategy_name": "TEXT NOT NULL DEFAULT 'S5'",
-        "setup_session": "TEXT",
-        "setup_type": "TEXT",
-        "entry_bar_high": "REAL",
-        "entry_bar_low": "REAL",
-    }
-    for name, ddl in columns.items():
-        if name not in existing:
-            conn.execute(f"ALTER TABLE positions ADD COLUMN {name} {ddl}")
 
 
 def db_get(conn: sqlite3.Connection, key: str, default: str = "") -> str:
@@ -307,47 +132,6 @@ def db_set(conn: sqlite3.Connection, key: str, value: str) -> None:
     conn.commit()
 
 
-def state_key(strategy_id: str, symbol: str, key: str) -> str:
-    return f"{strategy_id}:{symbol}:{key}"
-
-
-def should_block_same_side_reentry(
-    conn: sqlite3.Connection,
-    cfg: Config,
-    symbol: str,
-    strategy_id: str,
-    interval: str,
-    new_side: str,
-    closed_ts: datetime,
-) -> bool:
-    if cfg.reentry_cooldown_bars <= 0:
-        return False
-
-    last_exit_side = db_get(conn, state_key(strategy_id, symbol, "last_exit_side"), "")
-    last_exit_ts_raw = db_get(conn, state_key(strategy_id, symbol, "last_exit_time_utc"), "")
-    if not last_exit_side or not last_exit_ts_raw:
-        return False
-    if last_exit_side != new_side:
-        return False
-
-    try:
-        last_exit_ts = pd.Timestamp(last_exit_ts_raw)
-        curr_closed_ts = pd.Timestamp(closed_ts)
-        if last_exit_ts.tzinfo is None:
-            last_exit_ts = last_exit_ts.tz_localize("UTC")
-        else:
-            last_exit_ts = last_exit_ts.tz_convert("UTC")
-        if curr_closed_ts.tzinfo is None:
-            curr_closed_ts = curr_closed_ts.tz_localize("UTC")
-        else:
-            curr_closed_ts = curr_closed_ts.tz_convert("UTC")
-
-        min_wait = interval_to_timedelta(interval) * cfg.reentry_cooldown_bars
-        return curr_closed_ts < (last_exit_ts + min_wait)
-    except Exception:
-        return False
-
-
 def log_event(conn: sqlite3.Connection, level: str, message: str) -> None:
     conn.execute(
         "INSERT INTO events(event_time_utc, level, message) VALUES(?, ?, ?)",
@@ -356,77 +140,10 @@ def log_event(conn: sqlite3.Connection, level: str, message: str) -> None:
     conn.commit()
 
 
-def to_kucoin_symbol(symbol: str) -> str:
-    if "-" in symbol:
-        return symbol.upper()
-    if symbol.endswith("USDT") and len(symbol) > 4:
-        return f"{symbol[:-4]}-USDT"
-    if symbol.endswith("USDC") and len(symbol) > 4:
-        return f"{symbol[:-4]}-USDC"
-    if symbol.endswith("BTC") and len(symbol) > 3:
-        return f"{symbol[:-3]}-BTC"
-    return symbol
-
-
-def to_kucoin_interval(interval: str) -> str:
-    key = interval.strip().lower()
-    if key not in KUCOIN_INTERVAL_MAP:
-        supported = ", ".join(sorted(KUCOIN_INTERVAL_MAP.keys()))
-        raise ValueError(f"Unsupported interval for KuCoin: {interval}. supported={supported}")
-    return KUCOIN_INTERVAL_MAP[key]
-
-
-def to_bitget_symbol(symbol: str) -> str:
-    return symbol.replace("-", "").upper()
-
-
-def to_bitget_interval(interval: str) -> str:
-    key = interval.strip().lower()
-    if key not in BITGET_INTERVAL_MAP:
-        supported = ", ".join(sorted(BITGET_INTERVAL_MAP.keys()))
-        raise ValueError(f"Unsupported interval for Bitget: {interval}. supported={supported}")
-    return BITGET_INTERVAL_MAP[key]
-
-
-def interval_to_timedelta(interval: str) -> pd.Timedelta:
-    key = interval.strip().lower()
-    if key.endswith("m") and key[:-1].isdigit():
-        return pd.Timedelta(minutes=int(key[:-1]))
-    if key.endswith("h") and key[:-1].isdigit():
-        return pd.Timedelta(hours=int(key[:-1]))
-    if key.endswith("d") and key[:-1].isdigit():
-        return pd.Timedelta(days=int(key[:-1]))
-    if key.endswith("w") and key[:-1].isdigit():
-        return pd.Timedelta(weeks=int(key[:-1]))
-    raise ValueError(f"Unsupported BOT_INTERVAL format: {interval}")
-
-
-def resolve_bar_indices(df: pd.DataFrame, interval: str) -> tuple[int, int, datetime, datetime, bool]:
-    interval_td = interval_to_timedelta(interval)
-    last_idx = len(df) - 1
-    last_open_ts = pd.Timestamp(df.index[last_idx])
-    now_ts = pd.Timestamp.now(tz="UTC")
-    has_in_progress = now_ts < (last_open_ts + interval_td)
-
-    if has_in_progress and len(df) >= 2:
-        closed_idx = len(df) - 2
-        open_idx = len(df) - 1
-        closed_ts = df.index[closed_idx].to_pydatetime()
-        current_open_ts = df.index[open_idx].to_pydatetime()
-        return closed_idx, open_idx, closed_ts, current_open_ts, True
-
-    closed_idx = len(df) - 1
-    open_idx = len(df) - 1
-    closed_ts = df.index[closed_idx].to_pydatetime()
-    current_open_ts = (pd.Timestamp(closed_ts).tz_convert("UTC") + interval_td).to_pydatetime()
-    return closed_idx, open_idx, closed_ts, current_open_ts, False
-
-
-def fetch_klines_binance(symbol: str, interval: str, limit: int, verify: bool | str = True) -> pd.DataFrame:
+def fetch_klines(cfg: Config) -> pd.DataFrame:
     r = requests.get(
         BINANCE_KLINES_URL,
-        params={"symbol": symbol, "interval": interval, "limit": limit},
-        verify=verify,
+        params={"symbol": cfg.symbol, "interval": cfg.interval, "limit": cfg.kline_limit},
         timeout=20,
     )
     r.raise_for_status()
@@ -456,118 +173,39 @@ def fetch_klines_binance(symbol: str, interval: str, limit: int, verify: bool | 
     return df.set_index("timestamp").sort_index()
 
 
-def fetch_klines_kucoin(symbol: str, interval: str, limit: int, verify: bool | str = True) -> pd.DataFrame:
-    kucoin_symbol = to_kucoin_symbol(symbol)
-    kucoin_interval = to_kucoin_interval(interval)
-    r = requests.get(
-        KUCOIN_CANDLES_URL,
-        params={"symbol": kucoin_symbol, "type": kucoin_interval},
-        verify=verify,
-        timeout=20,
-    )
-    r.raise_for_status()
-    payload = r.json()
-    if payload.get("code") != "200000":
-        raise ValueError(f"KuCoin API error symbol={kucoin_symbol} code={payload.get('code')} msg={payload.get('msg')}")
-
-    raw = payload.get("data", [])
-    df = pd.DataFrame(raw, columns=["open_time", "open", "close", "high", "low", "volume", "turnover"])
-    for c in ["open", "high", "low", "close", "volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["open_time"] = pd.to_numeric(df["open_time"], errors="coerce")
-    df["timestamp"] = pd.to_datetime(df["open_time"], unit="s", utc=True)
-    df = df[["timestamp", "open", "high", "low", "close", "volume"]].dropna()
-    df = df.set_index("timestamp").sort_index()
-    if limit > 0:
-        df = df.tail(limit)
-    return df
-
-
-def fetch_klines_bitget(symbol: str, interval: str, limit: int, verify: bool | str = True) -> pd.DataFrame:
-    bitget_symbol = to_bitget_symbol(symbol)
-    bitget_interval = to_bitget_interval(interval)
-    r = requests.get(
-        BITGET_CANDLES_URL,
-        params={"symbol": bitget_symbol, "granularity": bitget_interval, "limit": max(1, min(limit, 1000))},
-        verify=verify,
-        timeout=20,
-    )
-    r.raise_for_status()
-    payload = r.json()
-    if payload.get("code") != "00000":
-        raise ValueError(f"Bitget API error symbol={bitget_symbol} code={payload.get('code')} msg={payload.get('msg')}")
-
-    raw = payload.get("data", [])
-    df = pd.DataFrame(raw, columns=["open_time", "open", "high", "low", "close", "volume", "quote_volume", "usdt_volume"])
-    for c in ["open", "high", "low", "close", "volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["open_time"] = pd.to_numeric(df["open_time"], errors="coerce")
-    df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    df = df[["timestamp", "open", "high", "low", "close", "volume"]].dropna()
-    return df.set_index("timestamp").sort_index()
-
-
-def fetch_klines(exchange: str, symbol: str, interval: str, limit: int, verify: bool | str = True) -> pd.DataFrame:
-    if exchange == "kucoin":
-        return fetch_klines_kucoin(symbol, interval, limit, verify=verify)
-    if exchange == "bitget":
-        return fetch_klines_bitget(symbol, interval, limit, verify=verify)
-    return fetch_klines_binance(symbol, interval, limit, verify=verify)
-
-
-def get_open_position(conn: sqlite3.Connection, symbol: str, strategy_id: str) -> Optional[sqlite3.Row]:
-    old_factory = conn.row_factory
+def get_open_position(conn: sqlite3.Connection) -> Optional[sqlite3.Row]:
     conn.row_factory = sqlite3.Row
     row = conn.execute(
-        """
-        SELECT * FROM positions
-        WHERE status='OPEN' AND symbol=? AND strategy_id=?
-        ORDER BY id DESC LIMIT 1
-        """,
-        (symbol, strategy_id),
+        "SELECT * FROM positions WHERE status='OPEN' ORDER BY id DESC LIMIT 1"
     ).fetchone()
-    conn.row_factory = old_factory
+    conn.row_factory = None
     return row
 
 
 def open_position(
     conn: sqlite3.Connection,
-    symbol: str,
-    strategy_id: str,
-    strategy_name: str,
+    cfg: Config,
     side: str,
     entry_time: datetime,
     entry_price: float,
     stop_price: float,
     tp_price: float,
     signal_bar_time: datetime,
-    setup_session: str = "",
-    setup_type: str = "",
-    entry_bar_high: float | None = None,
-    entry_bar_low: float | None = None,
 ) -> None:
     conn.execute(
         """
         INSERT INTO positions(
-            symbol, strategy_id, strategy_name, side, entry_time_utc, entry_price,
-            stop_price, tp_price, signal_bar_time_utc, setup_session, setup_type,
-            entry_bar_high, entry_bar_low, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')
+            symbol, side, entry_time_utc, entry_price, stop_price, tp_price, signal_bar_time_utc, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN')
         """,
         (
-            symbol,
-            strategy_id,
-            strategy_name,
+            cfg.symbol,
             side,
             entry_time.isoformat(),
             float(entry_price),
             float(stop_price),
             float(tp_price),
             signal_bar_time.isoformat(),
-            setup_session,
-            setup_type,
-            float(entry_bar_high) if entry_bar_high is not None else None,
-            float(entry_bar_low) if entry_bar_low is not None else None,
         ),
     )
     conn.commit()
@@ -600,516 +238,162 @@ def close_position(
     return pnl
 
 
-def strategy_signals(strategy_id: str, df: pd.DataFrame) -> list[dict[str, Any]]:
-    if strategy_id == "s5":
-        signals = combined_signals(df, S5_PARAMS)
-        for signal in signals:
-            signal["setup_session"] = ""
-            signal["setup_type"] = "S5"
-        return signals
-    if strategy_id == "ict_killzone_opt3":
-        return killzone_opt3_signals(df, KILLZONE_PARAMS)
-    if strategy_id in {"edge_ny_vol_long", "edge_breakdown_vol_short"}:
-        return edge_strategy_signals(strategy_id, df)
-    return []
-
-
-def _compute_atr(df: pd.DataFrame, period: int) -> pd.Series:
-    h, l, c = df["high"], df["low"], df["close"]
-    prev_c = c.shift(1)
-    tr = pd.concat([h - l, (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
-    return tr.ewm(span=period, adjust=False).mean()
-
-
-def edge_strategy_signals(strategy_id: str, df: pd.DataFrame) -> list[dict[str, Any]]:
-    atr = _compute_atr(df, EDGE_PARAMS["atr_period"])
-    vol_ma = df["volume"].rolling(EDGE_PARAMS["vol_ma_period"]).mean()
-    vol_expand = df["volume"] > (vol_ma * EDGE_PARAMS["vol_expand_ratio"])
-
-    ll20_prev_series = df["low"].shift(1).rolling(20).min()
-    signals: list[dict[str, Any]] = []
-    n = len(df)
-    if n < 60:
-        return signals
-
-    for i in range(30, n - 1):
-        if pd.isna(atr.iloc[i]) or atr.iloc[i] <= 0 or pd.isna(vol_ma.iloc[i]):
-            continue
-
-        close_i = float(df["close"].iloc[i])
-        ts = pd.Timestamp(df.index[i])
-        hour = ts.tz_convert("America/New_York").hour if ts.tzinfo is not None else ts.hour
-
-        if strategy_id == "edge_ny_vol_long":
-            # Edge pattern: NY session (17-21 NYC time) + volume expansion (found robust on ETH/ADA)
-            if (17 <= hour <= 21) and bool(vol_expand.iloc[i]):
-                stop = close_i - EDGE_PARAMS["atr_mult_sl"] * float(atr.iloc[i])
-                risk = close_i - stop
-                if risk > 0:
-                    signals.append(
-                        {
-                            "bar": i + 1,
-                            "direction": 1,
-                            "entry": close_i,
-                            "stop": stop,
-                            "tp": close_i + EDGE_PARAMS["rr_ratio"] * risk,
-                            "setup_session": "ny",
-                            "setup_type": "vol_expand",
-                        }
-                    )
-
-        elif strategy_id == "edge_breakdown_vol_short":
-            # Edge pattern: breakdown of previous 20-bar low + volume expansion
-            ll20_prev = ll20_prev_series.iloc[i]
-            if pd.notna(ll20_prev) and close_i < float(ll20_prev) and bool(vol_expand.iloc[i]):
-                stop = close_i + EDGE_PARAMS["atr_mult_sl"] * float(atr.iloc[i])
-                risk = stop - close_i
-                if risk > 0:
-                    signals.append(
-                        {
-                            "bar": i + 1,
-                            "direction": -1,
-                            "entry": close_i,
-                            "stop": stop,
-                            "tp": close_i - EDGE_PARAMS["rr_ratio"] * risk,
-                            "setup_session": "",
-                            "setup_type": "breakdown_vol",
-                        }
-                    )
-
-    return signals
-
-
-def valid_entry_prices(direction: int, entry_px: float, stop_px: float, tp_px: float) -> bool:
-    if entry_px <= 0 or stop_px <= 0 or tp_px <= 0:
-        return False
-    if direction == 1:
-        return entry_px > stop_px and tp_px > entry_px
-    return entry_px < stop_px and tp_px < entry_px
-
-
-def _same_entry_bar_new_extrema(
-    pos: sqlite3.Row,
-    bar_ts: datetime,
-    low: float,
-    high: float,
-) -> tuple[bool, bool]:
-    entry_bar_raw = pos["entry_time_utc"]
-    if not entry_bar_raw:
-        return True, True
-
-    entry_bar_ts = pd.Timestamp(entry_bar_raw)
-    current_bar_ts = pd.Timestamp(bar_ts)
-    if entry_bar_ts.tzinfo is None:
-        entry_bar_ts = entry_bar_ts.tz_localize("UTC")
-    else:
-        entry_bar_ts = entry_bar_ts.tz_convert("UTC")
-    if current_bar_ts.tzinfo is None:
-        current_bar_ts = current_bar_ts.tz_localize("UTC")
-    else:
-        current_bar_ts = current_bar_ts.tz_convert("UTC")
-
-    if current_bar_ts <= entry_bar_ts:
-        # Ignore candles at/before entry time to avoid using pre-entry or entry-candle extremes.
-        return False, False
-
-    return True, True
-
-
-def manage_position(
-    conn: sqlite3.Connection,
-    cfg: Config,
-    pos: sqlite3.Row,
-    df: pd.DataFrame,
-    closed_idx: int,
-    closed_ts: datetime,
-) -> None:
-    symbol = str(pos["symbol"])
-    strategy_id = str(pos["strategy_id"])
-    strategy_name = str(pos["strategy_name"])
-    side = str(pos["side"])
-    stop_px = float(pos["stop_price"])
-    tp_px = float(pos["tp_price"])
-    entry_px = float(pos["entry_price"])
-
-    low = float(df["low"].iloc[closed_idx])
-    high = float(df["high"].iloc[closed_idx])
-    close = float(df["close"].iloc[closed_idx])
-    LOGGER.debug(
-        "open position symbol=%s strategy=%s id=%s side=%s entry=%.4f stop=%.4f tp=%.4f low=%.4f high=%.4f",
-        symbol,
-        strategy_id,
-        pos["id"],
-        side,
-        entry_px,
-        stop_px,
-        tp_px,
-        low,
-        high,
-    )
-
-    raw_exit = None
-    reason = None
-    new_low_seen, new_high_seen = _same_entry_bar_new_extrema(pos, closed_ts, low, high)
-    if side == "long":
-        hit_sl = new_low_seen and low <= stop_px
-        hit_tp = new_high_seen and high >= tp_px
-        if hit_sl and hit_tp:
-            raw_exit, reason = stop_px, "both_hit_stop_first"
-        elif hit_sl:
-            raw_exit, reason = stop_px, "stop"
-        elif hit_tp:
-            raw_exit, reason = tp_px, "tp"
-    else:
-        hit_sl = new_high_seen and high >= stop_px
-        hit_tp = new_low_seen and low <= tp_px
-        if hit_sl and hit_tp:
-            raw_exit, reason = stop_px, "both_hit_stop_first"
-        elif hit_sl:
-            raw_exit, reason = stop_px, "stop"
-        elif hit_tp:
-            raw_exit, reason = tp_px, "tp"
-
-    if raw_exit is None and strategy_id == "ict_killzone_opt3":
-        if should_force_flat_after_ny(pd.Timestamp(closed_ts), KILLZONE_PARAMS):
-            raw_exit, reason = close, "flat_after_ny"
-
-    if raw_exit is None:
-        LOGGER.debug("position still active symbol=%s strategy=%s id=%s", symbol, strategy_id, pos["id"])
-        return
-
-    direction = 1 if side == "long" else -1
-    exit_px = apply_slippage(raw_exit, direction, is_entry=False, slippage_per_side=cfg.slippage_per_side)
-    pnl = close_position(conn, cfg, int(pos["id"]), side, entry_px, exit_px, reason)
-    db_set(conn, state_key(strategy_id, symbol, "last_exit_side"), side)
-    db_set(conn, state_key(strategy_id, symbol, "last_exit_time_utc"), closed_ts.replace(tzinfo=timezone.utc).isoformat())
-    LOGGER.info(
-        "position closed symbol=%s strategy=%s id=%s reason=%s exit=%.4f pnl=%+.2f",
-        symbol,
-        strategy_id,
-        pos["id"],
-        reason,
-        exit_px,
-        pnl,
-    )
-    msg = (
-        f"💰 平倉\n"
-        f"幣種: {symbol}\n"
-        f"策略: {strategy_name}\n"
-        f"方向: {'做多' if side == 'long' else '做空'}\n"
-        f"原因: {reason}\n"
-        f"進場: {entry_px:.4f}\n"
-        f"出場: {exit_px:.4f}\n"
-        f"盈虧: {pnl:+.2f} USDT\n"
-        f"時間: {fmt_ts(now_utc())}"
-    )
-    log_event(conn, "TRADE_EXIT", msg)
-    send_telegram(cfg, msg)
-
-
-def try_open_new_position(
-    conn: sqlite3.Connection,
-    cfg: Config,
-    symbol: str,
-    strategy_id: str,
-    df: pd.DataFrame,
-    closed_idx: int,
-    open_idx: int,
-    closed_ts: datetime,
-    current_open_ts: datetime,
-    interval: str,
-) -> None:
-    strategy_name = STRATEGY_NAMES[strategy_id]
-    key = state_key(strategy_id, symbol, "last_signal_bar_utc")
-    closed_ts_iso = closed_ts.replace(tzinfo=timezone.utc).isoformat()
-    last_processed_signal_ts = db_get(conn, key, "")
-    if last_processed_signal_ts == closed_ts_iso:
-        LOGGER.debug("skip signal check: already processed symbol=%s strategy=%s", symbol, strategy_id)
-        return
-
-    LOGGER.debug("checking signals symbol=%s strategy=%s closed_bar=%s", symbol, strategy_id, closed_ts_iso)
-    signals = strategy_signals(strategy_id, df)
-    target = [s for s in signals if int(s["bar"]) == open_idx]
-    LOGGER.debug(
-        "signals symbol=%s strategy=%s total=%s target_on_next_open=%s",
-        symbol,
-        strategy_id,
-        len(signals),
-        len(target),
-    )
-
-    if target:
-        signal = target[0]
-        direction = int(signal["direction"])
-        side = "long" if direction == 1 else "short"
-        if open_idx == closed_idx:
-            # Some exchanges only return closed candles. Enter at close to avoid backdating to the same candle open.
-            entry_raw = float(df["close"].iloc[closed_idx])
-            entry_bar_high = entry_raw
-            entry_bar_low = entry_raw
-        else:
-            entry_raw = float(df["open"].iloc[open_idx])
-            entry_bar_high = float(df["high"].iloc[open_idx])
-            entry_bar_low = float(df["low"].iloc[open_idx])
-        entry_px = apply_slippage(entry_raw, direction, is_entry=True, slippage_per_side=cfg.slippage_per_side)
-        stop_px = float(signal["stop"])
-        tp_px = float(signal["tp"])
-        setup_session = str(signal.get("setup_session", ""))
-        setup_type = str(signal.get("setup_type", ""))
-
-        if should_block_same_side_reentry(conn, cfg, symbol, strategy_id, interval, side, closed_ts):
-            LOGGER.info(
-                "reentry cooldown skip symbol=%s strategy=%s interval=%s side=%s closed_bar=%s cooldown_bars=%s",
-                symbol,
-                strategy_id,
-                interval,
-                side,
-                closed_ts_iso,
-                cfg.reentry_cooldown_bars,
-            )
-            db_set(conn, key, closed_ts_iso)
-            return
-
-        if valid_entry_prices(direction, entry_px, stop_px, tp_px):
-            LOGGER.info(
-                "opening position symbol=%s strategy=%s side=%s entry=%.4f stop=%.4f tp=%.4f setup=%s/%s",
-                symbol,
-                strategy_id,
-                side,
-                entry_px,
-                stop_px,
-                tp_px,
-                setup_session or "-",
-                setup_type or "-",
-            )
-            open_position(
-                conn=conn,
-                symbol=symbol,
-                strategy_id=strategy_id,
-                strategy_name=strategy_name,
-                side=side,
-                entry_time=current_open_ts,
-                entry_price=entry_px,
-                stop_price=stop_px,
-                tp_price=tp_px,
-                signal_bar_time=closed_ts,
-                setup_session=setup_session,
-                setup_type=setup_type,
-                entry_bar_high=entry_bar_high,
-                entry_bar_low=entry_bar_low,
-            )
-            msg = (
-                f"✅ 開倉成功\n"
-                f"幣種: {symbol}\n"
-                f"策略: {strategy_name}\n"
-                f"方向: {'做多' if side == 'long' else '做空'}\n"
-                f"進場價: {entry_px:.4f}\n"
-                f"止損價: {stop_px:.4f}\n"
-                f"止盈價: {tp_px:.4f}\n"
-                f"Session: {setup_session or '-'}\n"
-                f"Setup: {setup_type or '-'}\n"
-                f"時間: {fmt_ts(now_utc())}"
-            )
-            log_event(conn, "TRADE_ENTRY", msg)
-            send_telegram(cfg, msg)
-        else:
-            LOGGER.warning(
-                "signal skipped invalid prices symbol=%s strategy=%s direction=%s entry=%.4f stop=%.4f tp=%.4f",
-                symbol,
-                strategy_id,
-                direction,
-                entry_px,
-                stop_px,
-                tp_px,
-            )
-    else:
-        LOGGER.debug("no new signal symbol=%s strategy=%s", symbol, strategy_id)
-
-    db_set(conn, key, closed_ts_iso)
-
-
-def send_heartbeat(conn: sqlite3.Connection, cfg: Config) -> None:
-    last_hb = db_get(conn, "last_heartbeat_utc", "")
-    send_hb = True
-    if last_hb:
-        last_dt = datetime.fromisoformat(last_hb)
-        mins = (now_utc() - last_dt).total_seconds() / 60
-        send_hb = mins >= cfg.heartbeat_minutes
-
-    if not send_hb:
-        LOGGER.debug("heartbeat not due yet")
-        return
-
-    LOGGER.debug("sending heartbeat")
-    old_factory = conn.row_factory
-    conn.row_factory = sqlite3.Row
-    today = now_utc().date().isoformat()
-    rows = conn.execute(
-        """
-        SELECT
-            symbol,
-            strategy_id,
-            COALESCE(SUM(pnl_usdt), 0) AS pnl,
-            COUNT(*) AS trades,
-            COALESCE(SUM(CASE WHEN pnl_usdt > 0 THEN 1 ELSE 0 END), 0) AS wins
-        FROM positions
-        WHERE status='CLOSED' AND substr(exit_time_utc,1,10)=?
-        GROUP BY symbol, strategy_id
-        ORDER BY symbol, strategy_id
-        """,
-        (today,),
-    ).fetchall()
-    overall = conn.execute(
-        """
-        SELECT
-            COALESCE(SUM(pnl_usdt), 0) AS total_pnl,
-            COALESCE(SUM(CASE WHEN pnl_usdt < 0 THEN pnl_usdt ELSE 0 END), 0) AS total_loss,
-            COUNT(*) AS total_trades,
-            COALESCE(SUM(CASE WHEN pnl_usdt > 0 THEN 1 ELSE 0 END), 0) AS total_wins
-        FROM positions
-        WHERE status='CLOSED'
-        """
-    ).fetchone()
-    open_cnt = conn.execute("SELECT COUNT(*) AS c FROM positions WHERE status='OPEN'").fetchone()["c"]
-    conn.row_factory = old_factory
-
-    lines = [
-        "❤️ 機器人運作正常",
-        f"時間: {fmt_ts(now_utc())}",
-        f"掃描幣種: {', '.join(cfg.symbols)}",
-        f"策略: {', '.join(cfg.strategies)}",
-        f"目前持倉: {open_cnt}",
-        f"累計已平倉損益: {float(overall['total_pnl']):+.2f} USDT",
-        f"累計總虧損: {float(overall['total_loss']):.2f} USDT",
-    ]
-    total_trades = int(overall["total_trades"])
-    total_wins = int(overall["total_wins"])
-    total_win_rate = (total_wins / total_trades * 100) if total_trades else 0.0
-    lines.append(f"累計交易: {total_trades} 筆 / 勝率 {total_win_rate:.1f}%")
-    if rows:
-        lines.append("今日已平倉:")
-        for row in rows:
-            trades = int(row["trades"])
-            wins = int(row["wins"])
-            win_rate = (wins / trades * 100) if trades else 0.0
-            lines.append(
-                f"- {row['symbol']} {row['strategy_id']}: {float(row['pnl']):+.2f} USDT / {trades} 筆 / 勝率 {win_rate:.1f}%"
-            )
-    else:
-        lines.append("今日已平倉: 0 筆")
-
-    send_telegram(cfg, "\n".join(lines))
-    db_set(conn, "last_heartbeat_utc", now_utc().isoformat())
-
-
-def main() -> None:
+def main():
     cfg = Config()
-    setup_logging(cfg)
-    strategy_intervals = {sid: strategy_interval(sid) for sid in cfg.strategies}
-    unique_intervals = sorted(set(strategy_intervals.values()))
-    if cfg.interval != "15m":
-        LOGGER.info("BOT_INTERVAL=%s ignored; using per-strategy intervals (legacy=15m, edge=1h)", cfg.interval)
-    if cfg.requests_verify is False:
-        LOGGER.warning("SSL verify disabled for HTTPS requests (BOT_SSL_VERIFY=false)")
-    elif isinstance(cfg.requests_verify, str):
-        LOGGER.info("Using custom CA bundle: %s", cfg.requests_verify)
     conn = sqlite3.connect(cfg.db_path)
     init_db(conn)
     log_event(conn, "INFO", "bot started")
-    LOGGER.info(
-        "bot started exchange=%s symbols=%s strategies=%s intervals=%s loop=%ss db=%s telegram=%s log=%s ssl_verify=%s",
-        cfg.exchange,
-        ",".join(cfg.symbols),
-        ",".join(cfg.strategies),
-        ",".join(unique_intervals),
-        cfg.loop_seconds,
-        cfg.db_path,
-        "enabled" if cfg.tg_token and cfg.tg_chat_id else "disabled",
-        cfg.log_path or "terminal-only",
-        cfg.requests_verify,
-    )
-    send_telegram(
-        cfg,
-        f"❤️ Multi-strategy 機器人啟動\n"
-        f"交易所: {cfg.exchange}\n"
-        f"幣種: {', '.join(cfg.symbols)}\n"
-        f"策略: {', '.join(cfg.strategies)}\n"
-        f"週期: legacy=15m, edge=1h\n"
-        f"時間: {fmt_ts(now_utc())}",
-    )
+    send_telegram(cfg, f"❤️ S5 機器人啟動\n標的: {cfg.symbol}\n週期: {cfg.interval}\n時間: {fmt_ts(now_utc())}")
 
-    tick = 0
     while True:
-        tick += 1
-        started = time.monotonic()
         try:
-            for symbol in cfg.symbols:
-                interval_dfs: dict[str, pd.DataFrame] = {}
-                for interval in unique_intervals:
-                    LOGGER.debug("tick=%s fetching klines exchange=%s symbol=%s interval=%s", tick, cfg.exchange, symbol, interval)
-                    df_i = fetch_klines(cfg.exchange, symbol, interval, cfg.kline_limit, verify=cfg.requests_verify)
-                    if len(df_i) < 220:
-                        LOGGER.warning("tick=%s symbol=%s interval=%s not enough bars: bars=%s need>=220", tick, symbol, interval, len(df_i))
-                        continue
-                    interval_dfs[interval] = df_i
+            df = fetch_klines(cfg)
+            if len(df) < 220:
+                time.sleep(cfg.loop_seconds)
+                continue
 
-                for strategy_id in cfg.strategies:
-                    interval = strategy_intervals[strategy_id]
-                    df = interval_dfs.get(interval)
-                    if df is None:
-                        LOGGER.debug("skip strategy due to missing bars symbol=%s strategy=%s interval=%s", symbol, strategy_id, interval)
-                        continue
+            # Binance returns the current in-progress candle as the last row.
+            closed_idx = len(df) - 2
+            open_idx = len(df) - 1
+            closed_ts = df.index[closed_idx].to_pydatetime()
+            current_open_ts = df.index[open_idx].to_pydatetime()
 
-                    closed_idx, open_idx, closed_ts, current_open_ts, has_in_progress = resolve_bar_indices(df, interval)
-                    closed_close = float(df["close"].iloc[closed_idx])
-                    LOGGER.info(
-                        "alive tick=%s symbol=%s strategy=%s interval=%s bars=%s closed_bar=%s close=%.4f current_open=%s in_progress=%s",
-                        tick,
-                        symbol,
-                        strategy_id,
-                        interval,
-                        len(df),
-                        closed_ts.isoformat(),
-                        closed_close,
-                        current_open_ts.isoformat(),
-                        has_in_progress,
+            # 1) manage current open position using latest CLOSED candle range.
+            pos = get_open_position(conn)
+            if pos is not None:
+                side = pos["side"]
+                stop_px = float(pos["stop_price"])
+                tp_px = float(pos["tp_price"])
+                entry_px = float(pos["entry_price"])
+
+                low = float(df["low"].iloc[closed_idx])
+                high = float(df["high"].iloc[closed_idx])
+
+                raw_exit = None
+                reason = None
+                if side == "long":
+                    hit_sl = low <= stop_px
+                    hit_tp = high >= tp_px
+                    if hit_sl and hit_tp:
+                        raw_exit, reason = stop_px, "both_hit_stop_first"
+                    elif hit_sl:
+                        raw_exit, reason = stop_px, "stop"
+                    elif hit_tp:
+                        raw_exit, reason = tp_px, "tp"
+                else:
+                    hit_sl = high >= stop_px
+                    hit_tp = low <= tp_px
+                    if hit_sl and hit_tp:
+                        raw_exit, reason = stop_px, "both_hit_stop_first"
+                    elif hit_sl:
+                        raw_exit, reason = stop_px, "stop"
+                    elif hit_tp:
+                        raw_exit, reason = tp_px, "tp"
+
+                if raw_exit is not None:
+                    direction = 1 if side == "long" else -1
+                    exit_px = apply_slippage(raw_exit, direction, is_entry=False)
+                    pnl = close_position(conn, cfg, int(pos["id"]), side, entry_px, exit_px, reason)
+                    msg = (
+                        f"💰 平倉\n"
+                        f"幣種: {cfg.symbol}\n"
+                        f"方向: {'做多' if side == 'long' else '做空'}\n"
+                        f"原因: {reason}\n"
+                        f"進場: {entry_px:.4f}\n"
+                        f"出場: {exit_px:.4f}\n"
+                        f"盈虧: {pnl:+.2f} USDT\n"
+                        f"時間: {fmt_ts(now_utc())}"
                     )
+                    log_event(conn, "TRADE_EXIT", msg)
+                    send_telegram(cfg, msg)
 
-                    pos = get_open_position(conn, symbol, strategy_id)
-                    if pos is not None:
-                        manage_position(conn, cfg, pos, df, closed_idx, closed_ts)
+            # 2) open new position when flat and there's a new closed bar signal.
+            pos = get_open_position(conn)
+            last_processed_signal_ts = db_get(conn, "last_signal_bar_utc", "")
+            closed_ts_iso = closed_ts.replace(tzinfo=timezone.utc).isoformat()
 
-                    pos = get_open_position(conn, symbol, strategy_id)
-                    if pos is not None and has_in_progress:
-                        manage_position(conn, cfg, pos, df, open_idx, current_open_ts)
+            if pos is None and last_processed_signal_ts != closed_ts_iso:
+                signals = combined_signals(df, S5_PARAMS)
+                target = [s for s in signals if int(s["bar"]) == closed_idx]
+                if target:
+                    s = target[0]
+                    direction = int(s["direction"])
+                    side = "long" if direction == 1 else "short"
+                    entry_raw = float(df["open"].iloc[open_idx])
+                    entry_px = apply_slippage(entry_raw, direction, is_entry=True)
+                    stop_px = float(s["stop"])
+                    tp_px = float(s["tp"])
 
-                    pos = get_open_position(conn, symbol, strategy_id)
-                    if pos is None:
-                        try_open_new_position(
+                    if entry_px > 0 and stop_px > 0 and tp_px > 0:
+                        open_position(
                             conn=conn,
                             cfg=cfg,
-                            symbol=symbol,
-                            strategy_id=strategy_id,
-                            df=df,
-                            closed_idx=closed_idx,
-                            open_idx=open_idx,
-                            closed_ts=closed_ts,
-                            current_open_ts=current_open_ts,
-                            interval=interval,
+                            side=side,
+                            entry_time=current_open_ts,
+                            entry_price=entry_px,
+                            stop_price=stop_px,
+                            tp_price=tp_px,
+                            signal_bar_time=closed_ts,
                         )
-                    else:
-                        LOGGER.debug("skip signal check: open position symbol=%s strategy=%s interval=%s", symbol, strategy_id, interval)
+                        msg = (
+                            f"✅ 開倉成功\n"
+                            f"幣種: {cfg.symbol}\n"
+                            f"方向: {'做多' if side == 'long' else '做空'}\n"
+                            f"進場價: {entry_px:.4f}\n"
+                            f"止損價: {stop_px:.4f}\n"
+                            f"止盈價: {tp_px:.4f}\n"
+                            f"策略: S5 (BOS+FVG+RSI, RR=1.5)\n"
+                            f"時間: {fmt_ts(now_utc())}"
+                        )
+                        log_event(conn, "TRADE_ENTRY", msg)
+                        send_telegram(cfg, msg)
 
-            send_heartbeat(conn, cfg)
+                db_set(conn, "last_signal_bar_utc", closed_ts_iso)
+
+            # 3) heartbeat
+            last_hb = db_get(conn, "last_heartbeat_utc", "")
+            send_hb = True
+            if last_hb:
+                last_dt = datetime.fromisoformat(last_hb)
+                mins = (now_utc() - last_dt).total_seconds() / 60
+                send_hb = mins >= cfg.heartbeat_minutes
+
+            if send_hb:
+                conn.row_factory = sqlite3.Row
+                today = now_utc().date().isoformat()
+                row = conn.execute(
+                    """
+                    SELECT
+                        COALESCE(SUM(pnl_usdt), 0) AS pnl,
+                        COUNT(*) AS trades,
+                        COALESCE(SUM(CASE WHEN pnl_usdt > 0 THEN 1 ELSE 0 END), 0) AS wins
+                    FROM positions
+                    WHERE status='CLOSED' AND substr(exit_time_utc,1,10)=?
+                    """,
+                    (today,),
+                ).fetchone()
+                open_cnt = conn.execute("SELECT COUNT(*) AS c FROM positions WHERE status='OPEN'").fetchone()["c"]
+                conn.row_factory = None
+
+                trades = int(row["trades"]) if row else 0
+                wins = int(row["wins"]) if row else 0
+                win_rate = (wins / trades * 100) if trades else 0.0
+                pnl_today = float(row["pnl"]) if row else 0.0
+                hb_msg = (
+                    f"❤️ 機器人運作正常\n"
+                    f"時間: {fmt_ts(now_utc())}\n"
+                    f"今日盈虧: {pnl_today:+.2f} USDT\n"
+                    f"今日交易: {trades} 筆 (勝率 {win_rate:.1f}%)\n"
+                    f"目前持倉: {open_cnt}"
+                )
+                send_telegram(cfg, hb_msg)
+                db_set(conn, "last_heartbeat_utc", now_utc().isoformat())
 
         except Exception as e:
             msg = f"⚠️ bot error: {type(e).__name__} {e}"
-            LOGGER.exception("tick=%s failed: %s", tick, type(e).__name__)
             log_event(conn, "ERROR", msg)
             send_telegram(cfg, msg)
 
-        elapsed = time.monotonic() - started
-        LOGGER.debug("tick=%s finished in %.2fs; sleeping %ss", tick, elapsed, cfg.loop_seconds)
         time.sleep(cfg.loop_seconds)
 
 
