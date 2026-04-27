@@ -12,6 +12,7 @@ This script does NOT place real exchange orders.
 from __future__ import annotations
 
 import os
+import sys
 import time
 import sqlite3
 from dataclasses import dataclass
@@ -21,6 +22,9 @@ from typing import Optional
 
 import pandas as pd
 import requests
+
+# Add current directory to path so imports work from any location
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from research import combined_signals
 from live_practical_session_report import apply_slippage
