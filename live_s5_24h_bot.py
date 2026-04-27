@@ -2,7 +2,7 @@
 S5 24h signal bot (paper-trade style)
 -------------------------------------
 - Polls Binance spot klines (default: BTCUSDT 15m)
-- Uses research.py::combined_signals with S5 params (rr=1.5)
+- Uses s5_strategy_core.py::combined_signals with S5 params (rr=1.5)
 - Opens/closes a simulated position and logs to SQLite
 - Sends Telegram messages for entry/exit/heartbeat (optional)
 
@@ -34,7 +34,7 @@ print(f"[DEBUG] research.py exists: {(script_dir / 'research.py').exists()}", fi
 print(f"[DEBUG] live_practical_session_report.py exists: {(script_dir / 'live_practical_session_report.py').exists()}", file=sys.stderr)
 
 try:
-    from research import combined_signals
+    from s5_strategy_core import combined_signals
     from live_practical_session_report import apply_slippage
 except ImportError as e:
     print(f"[ERROR] 无法导入必要模块: {e}", file=sys.stderr)
