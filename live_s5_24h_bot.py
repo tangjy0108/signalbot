@@ -1,7 +1,7 @@
 """
 S5 24h signal bot (paper-trade style)
 -------------------------------------
-- Polls Binance spot klines (default: BTCUSDT 15m)
+- Polls exchange klines (Binance or Bitget, default: BTCUSDT 15m)
 - Uses research.py::combined_signals with S5 params (rr=1.5)
 - Opens/closes a simulated position and logs to SQLite
 - Sends Telegram messages for entry/exit/heartbeat (optional)
@@ -27,7 +27,11 @@ from research import combined_signals
 from live_practical_session_report import apply_slippage
 
 
-BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+BINANCE_KLINES_URLS = (
+    "https://api.binance.com/api/v3/klines",
+    "https://data-api.binance.vision/api/v3/klines",
+)
+BITGET_KLINES_URL = "https://api.bitget.com/api/v2/mix/market/candles"
 
 S5_PARAMS = {
     "lookback": 10,
@@ -89,7 +93,12 @@ setup_logging()
 
 @dataclass
 class Config:
-    symbol: str = os.getenv("BOT_SYMBOL", "BTCUSDT")
+    exchange: str = os.getenv("BOT_EXCHANGE", "binance").strip().lower()
+    symbol: str = (
+        os.getenv("BOT_SYMBOL")
+        or os.getenv("BOT_SYMBOLS", "BTCUSDT").split(",")[0].strip()
+        or "BTCUSDT"
+    )
     interval: str = os.getenv("BOT_INTERVAL", "15m")
     kline_limit: int = int(os.getenv("BOT_KLINE_LIMIT", "600"))
     db_path: str = os.getenv("BOT_DB_PATH", "live_s5_bot.db")
@@ -97,6 +106,7 @@ class Config:
     heartbeat_minutes: int = int(os.getenv("BOT_HEARTBEAT_MINUTES", "60"))
     log_level: str = os.getenv("BOT_LOG_LEVEL", "INFO")
     log_path: str = os.getenv("BOT_LOG_PATH", "live_s5_bot.log")
+    bitget_product_type: str = os.getenv("BOT_BITGET_PRODUCT_TYPE", "USDT-FUTURES")
 
     # paper-trade assumptions
     notional_usdt: float = float(os.getenv("BOT_NOTIONAL_USDT", "200"))
@@ -193,20 +203,28 @@ def log_event(conn: sqlite3.Connection, level: str, message: str) -> None:
     LOGGER.log(logger_level, message)
 
 
-def fetch_klines(cfg: Config) -> pd.DataFrame:
-    LOGGER.debug(
-        "fetching klines symbol=%s interval=%s limit=%s",
-        cfg.symbol,
-        cfg.interval,
-        cfg.kline_limit,
-    )
-    r = requests.get(
-        BINANCE_KLINES_URL,
-        params={"symbol": cfg.symbol, "interval": cfg.interval, "limit": cfg.kline_limit},
-        timeout=20,
-    )
-    r.raise_for_status()
-    raw = r.json()
+def bitget_granularity(interval: str) -> str:
+    mapping = {
+        "1m": "1m",
+        "3m": "3m",
+        "5m": "5m",
+        "15m": "15m",
+        "30m": "30m",
+        "1h": "1H",
+        "2h": "2H",
+        "4h": "4H",
+        "6h": "6H",
+        "12h": "12H",
+        "1d": "1D",
+        "1w": "1W",
+    }
+    normalized = interval.strip().lower()
+    if normalized not in mapping:
+        raise ValueError(f"unsupported Bitget interval: {interval}")
+    return mapping[normalized]
+
+
+def parse_binance_klines(raw: list[object]) -> pd.DataFrame:
     df = pd.DataFrame(
         raw,
         columns=[
@@ -230,6 +248,112 @@ def fetch_klines(cfg: Config) -> pd.DataFrame:
     df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
     df = df[["timestamp", "open", "high", "low", "close", "volume"]].dropna()
     return df.set_index("timestamp").sort_index()
+
+
+def fetch_binance_klines(cfg: Config) -> pd.DataFrame:
+    LOGGER.debug(
+        "fetching Binance klines symbol=%s interval=%s limit=%s",
+        cfg.symbol,
+        cfg.interval,
+        cfg.kline_limit,
+    )
+
+    last_error: Optional[Exception] = None
+    for url in BINANCE_KLINES_URLS:
+        try:
+            r = requests.get(
+                url,
+                params={"symbol": cfg.symbol, "interval": cfg.interval, "limit": cfg.kline_limit},
+                timeout=20,
+            )
+            r.raise_for_status()
+            return parse_binance_klines(r.json())
+        except requests.HTTPError as exc:
+            last_error = exc
+            status_code = exc.response.status_code if exc.response is not None else None
+            if status_code in {403, 451}:
+                LOGGER.warning("Binance endpoint blocked status=%s url=%s", status_code, url)
+                continue
+            raise
+        except requests.RequestException as exc:
+            last_error = exc
+            LOGGER.warning("Binance request failed url=%s error=%s", url, exc)
+            continue
+
+    if isinstance(last_error, requests.HTTPError):
+        status_code = last_error.response.status_code if last_error.response is not None else None
+        if status_code == 451:
+            raise RuntimeError(
+                "Binance API returned 451 Unavailable For Legal Reasons. "
+                "Your VM region cannot access Binance market data. "
+                "Set BOT_EXCHANGE=bitget or run the bot from a region where Binance is reachable."
+            ) from last_error
+        if status_code == 403:
+            raise RuntimeError(
+                "Binance API returned 403 Forbidden. "
+                "The current network blocks Binance market data. "
+                "Set BOT_EXCHANGE=bitget or use a reachable network."
+            ) from last_error
+
+    raise RuntimeError(f"failed to fetch Binance klines for {cfg.symbol}") from last_error
+
+
+def fetch_bitget_klines(cfg: Config) -> pd.DataFrame:
+    granularity = bitget_granularity(cfg.interval)
+    LOGGER.debug(
+        "fetching Bitget klines symbol=%s interval=%s limit=%s productType=%s",
+        cfg.symbol,
+        granularity,
+        cfg.kline_limit,
+        cfg.bitget_product_type,
+    )
+    r = requests.get(
+        BITGET_KLINES_URL,
+        params={
+            "symbol": cfg.symbol,
+            "productType": cfg.bitget_product_type,
+            "granularity": granularity,
+            "limit": min(cfg.kline_limit, 1000),
+        },
+        timeout=20,
+    )
+    r.raise_for_status()
+    payload = r.json()
+    if payload.get("code") not in {None, "00000"}:
+        raise RuntimeError(
+            f"Bitget API error code={payload.get('code')} msg={payload.get('msg', '')}"
+        )
+
+    rows = payload.get("data") or []
+    parsed_rows = []
+    for row in rows:
+        if not isinstance(row, list) or len(row) < 6:
+            continue
+        parsed_rows.append(
+            {
+                "timestamp": pd.to_datetime(int(row[0]), unit="ms", utc=True),
+                "open": pd.to_numeric(row[1], errors="coerce"),
+                "high": pd.to_numeric(row[2], errors="coerce"),
+                "low": pd.to_numeric(row[3], errors="coerce"),
+                "close": pd.to_numeric(row[4], errors="coerce"),
+                "volume": pd.to_numeric(row[5], errors="coerce"),
+            }
+        )
+
+    df = pd.DataFrame(parsed_rows)
+    if df.empty:
+        raise RuntimeError(f"Bitget returned no usable candle data for {cfg.symbol}")
+
+    df = df.dropna().drop_duplicates(subset=["timestamp"])
+    return df.set_index("timestamp").sort_index()
+
+
+def fetch_klines(cfg: Config) -> pd.DataFrame:
+    if cfg.exchange == "binance":
+        return fetch_binance_klines(cfg)
+    if cfg.exchange == "bitget":
+        return fetch_bitget_klines(cfg)
+    raise ValueError(f"unsupported BOT_EXCHANGE: {cfg.exchange}")
 
 
 def get_open_position(conn: sqlite3.Connection) -> Optional[sqlite3.Row]:
@@ -305,7 +429,7 @@ def main():
         conn,
         "INFO",
         (
-            f"bot started symbol={cfg.symbol} interval={cfg.interval} "
+            f"bot started exchange={cfg.exchange} symbol={cfg.symbol} interval={cfg.interval} "
             f"loop={cfg.loop_seconds}s db={cfg.db_path} log={cfg.log_path}"
         ),
     )
