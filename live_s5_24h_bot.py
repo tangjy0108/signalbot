@@ -25,6 +25,10 @@ import requests
 
 from research import combined_signals
 from live_practical_session_report import apply_slippage
+from ict_killzone_opt3_core import DEFAULT_PARAMS as KILLZONE_PARAMS
+from ict_killzone_opt3_core import killzone_opt3_signals, should_force_flat_after_ny
+from intraday_edge_hunt import add_indicators as add_edge_indicators
+from intraday_edge_hunt import build_conditions
 
 
 BINANCE_KLINES_URLS = (
@@ -41,6 +45,30 @@ S5_PARAMS = {
     "rsi_os": 35,
     "atr_mult_sl": 1.0,
     "rr_ratio": 1.5,  # best balance from current RR sweep
+}
+
+EDGE_NY_VOL_LONG_PARAMS = {
+    "atr_stop_mult": 1.0,
+    "rr_ratio": 1.2,
+}
+
+EDGE_BREAKDOWN_VOL_SHORT_PARAMS = {
+    "atr_stop_mult": 1.0,
+    "rr_ratio": 1.2,
+}
+
+ACTIVE_STRATEGIES = (
+    "s5",
+    "ict_killzone_opt3",
+    "edge_ny_vol_long",
+    "edge_breakdown_vol_short",
+)
+
+STRATEGY_NAMES = {
+    "s5": "S5",
+    "ict_killzone_opt3": "ICT Killzone Opt3",
+    "edge_ny_vol_long": "NY Volume Long",
+    "edge_breakdown_vol_short": "Breakdown Volume Short",
 }
 
 
@@ -159,6 +187,10 @@ def init_db(conn: sqlite3.Connection) -> None:
             tp_price REAL NOT NULL,
             signal_bar_time_utc TEXT NOT NULL,
             status TEXT NOT NULL,
+            strategy_id TEXT NOT NULL DEFAULT 's5',
+            strategy_name TEXT NOT NULL DEFAULT 'S5',
+            setup_session TEXT,
+            setup_type TEXT,
             exit_time_utc TEXT,
             exit_price REAL,
             exit_reason TEXT,
@@ -176,6 +208,21 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    ensure_position_columns(conn)
+    conn.commit()
+
+
+def ensure_position_columns(conn: sqlite3.Connection) -> None:
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(positions)").fetchall()}
+    columns = {
+        "strategy_id": "TEXT NOT NULL DEFAULT 's5'",
+        "strategy_name": "TEXT NOT NULL DEFAULT 'S5'",
+        "setup_session": "TEXT",
+        "setup_type": "TEXT",
+    }
+    for name, ddl in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE positions ADD COLUMN {name} {ddl}")
     conn.commit()
 
 
@@ -356,10 +403,87 @@ def fetch_klines(cfg: Config) -> pd.DataFrame:
     raise ValueError(f"unsupported BOT_EXCHANGE: {cfg.exchange}")
 
 
-def get_open_position(conn: sqlite3.Connection) -> Optional[sqlite3.Row]:
+def strategy_name(strategy_id: str) -> str:
+    return STRATEGY_NAMES.get(strategy_id, strategy_id)
+
+
+def edge_strategy_signals(df: pd.DataFrame, strategy_id: str) -> list[dict[str, object]]:
+    enriched = add_edge_indicators(df)
+    long_c, short_c = build_conditions(enriched)
+    atr = enriched["atr14"]
+    close = enriched["close"]
+
+    signals: list[dict[str, object]] = []
+    for i in range(1, len(enriched) - 1):
+        atr_value = float(atr.iloc[i]) if pd.notna(atr.iloc[i]) else float("nan")
+        close_value = float(close.iloc[i]) if pd.notna(close.iloc[i]) else float("nan")
+        if not pd.notna(atr_value) or atr_value <= 0 or not pd.notna(close_value) or close_value <= 0:
+            continue
+
+        if strategy_id == "edge_ny_vol_long":
+            is_signal = bool(long_c["vol_expand"].iloc[i] and long_c["session_ny"].iloc[i])
+            if not is_signal:
+                continue
+            stop = close_value - atr_value * EDGE_NY_VOL_LONG_PARAMS["atr_stop_mult"]
+            if close_value <= stop:
+                continue
+            tp = close_value + (close_value - stop) * EDGE_NY_VOL_LONG_PARAMS["rr_ratio"]
+            signals.append(
+                {
+                    "bar": i + 1,
+                    "direction": 1,
+                    "entry": close_value,
+                    "stop": float(stop),
+                    "tp": float(tp),
+                    "setup_session": "New York",
+                    "setup_type": "NY Volume Long",
+                }
+            )
+
+        if strategy_id == "edge_breakdown_vol_short":
+            is_signal = bool(short_c["breakdown_20h"].iloc[i] and short_c["vol_expand"].iloc[i])
+            if not is_signal:
+                continue
+            stop = close_value + atr_value * EDGE_BREAKDOWN_VOL_SHORT_PARAMS["atr_stop_mult"]
+            if close_value >= stop:
+                continue
+            tp = close_value - (stop - close_value) * EDGE_BREAKDOWN_VOL_SHORT_PARAMS["rr_ratio"]
+            signals.append(
+                {
+                    "bar": i + 1,
+                    "direction": -1,
+                    "entry": close_value,
+                    "stop": float(stop),
+                    "tp": float(tp),
+                    "setup_session": "Any",
+                    "setup_type": "Breakdown Volume Short",
+                }
+            )
+
+    return signals
+
+
+def strategy_signals(df: pd.DataFrame, strategy_id: str) -> list[dict[str, object]]:
+    if strategy_id == "s5":
+        return combined_signals(df, S5_PARAMS)
+    if strategy_id == "ict_killzone_opt3":
+        return killzone_opt3_signals(df, KILLZONE_PARAMS)
+    if strategy_id in {"edge_ny_vol_long", "edge_breakdown_vol_short"}:
+        return edge_strategy_signals(df, strategy_id)
+    return []
+
+
+def get_open_position(conn: sqlite3.Connection, symbol: str, strategy_id: str) -> Optional[sqlite3.Row]:
     conn.row_factory = sqlite3.Row
     row = conn.execute(
-        "SELECT * FROM positions WHERE status='OPEN' ORDER BY id DESC LIMIT 1"
+        """
+        SELECT *
+        FROM positions
+        WHERE status='OPEN' AND symbol=? AND strategy_id=?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (symbol, strategy_id),
     ).fetchone()
     conn.row_factory = None
     return row
@@ -368,18 +492,22 @@ def get_open_position(conn: sqlite3.Connection) -> Optional[sqlite3.Row]:
 def open_position(
     conn: sqlite3.Connection,
     cfg: Config,
+    strategy_id: str,
     side: str,
     entry_time: datetime,
     entry_price: float,
     stop_price: float,
     tp_price: float,
     signal_bar_time: datetime,
+    setup_session: str = "",
+    setup_type: str = "",
 ) -> None:
     conn.execute(
         """
         INSERT INTO positions(
-            symbol, side, entry_time_utc, entry_price, stop_price, tp_price, signal_bar_time_utc, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN')
+            symbol, side, entry_time_utc, entry_price, stop_price, tp_price, signal_bar_time_utc,
+            status, strategy_id, strategy_name, setup_session, setup_type
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?)
         """,
         (
             cfg.symbol,
@@ -389,6 +517,10 @@ def open_position(
             float(stop_price),
             float(tp_price),
             signal_bar_time.isoformat(),
+            strategy_id,
+            strategy_name(strategy_id),
+            setup_session,
+            setup_type,
         ),
     )
     conn.commit()
@@ -430,7 +562,7 @@ def main():
         "INFO",
         (
             f"bot started exchange={cfg.exchange} symbol={cfg.symbol} interval={cfg.interval} "
-            f"loop={cfg.loop_seconds}s db={cfg.db_path} log={cfg.log_path}"
+            f"strategies={','.join(ACTIVE_STRATEGIES)} loop={cfg.loop_seconds}s db={cfg.db_path} log={cfg.log_path}"
         ),
     )
     send_telegram(cfg, f"❤️ S5 機器人啟動\n標的: {cfg.symbol}\n週期: {cfg.interval}\n時間: {fmt_ts(now_utc())}")
@@ -456,100 +588,123 @@ def main():
                 float(df["close"].iloc[closed_idx]),
             )
 
-            # 1) manage current open position using latest CLOSED candle range.
-            pos = get_open_position(conn)
-            if pos is not None:
-                side = pos["side"]
-                stop_px = float(pos["stop_price"])
-                tp_px = float(pos["tp_price"])
-                entry_px = float(pos["entry_price"])
-
-                low = float(df["low"].iloc[closed_idx])
-                high = float(df["high"].iloc[closed_idx])
-
-                raw_exit = None
-                reason = None
-                if side == "long":
-                    hit_sl = low <= stop_px
-                    hit_tp = high >= tp_px
-                    if hit_sl and hit_tp:
-                        raw_exit, reason = stop_px, "both_hit_stop_first"
-                    elif hit_sl:
-                        raw_exit, reason = stop_px, "stop"
-                    elif hit_tp:
-                        raw_exit, reason = tp_px, "tp"
-                else:
-                    hit_sl = high >= stop_px
-                    hit_tp = low <= tp_px
-                    if hit_sl and hit_tp:
-                        raw_exit, reason = stop_px, "both_hit_stop_first"
-                    elif hit_sl:
-                        raw_exit, reason = stop_px, "stop"
-                    elif hit_tp:
-                        raw_exit, reason = tp_px, "tp"
-
-                if raw_exit is not None:
-                    direction = 1 if side == "long" else -1
-                    exit_px = apply_slippage(raw_exit, direction, is_entry=False)
-                    pnl = close_position(conn, cfg, int(pos["id"]), side, entry_px, exit_px, reason)
-                    msg = (
-                        f"💰 平倉\n"
-                        f"幣種: {cfg.symbol}\n"
-                        f"方向: {'做多' if side == 'long' else '做空'}\n"
-                        f"原因: {reason}\n"
-                        f"進場: {entry_px:.4f}\n"
-                        f"出場: {exit_px:.4f}\n"
-                        f"盈虧: {pnl:+.2f} USDT\n"
-                        f"時間: {fmt_ts(now_utc())}"
-                    )
-                    log_event(conn, "TRADE_EXIT", msg)
-                    send_telegram(cfg, msg)
-
-            # 2) open new position when flat and there's a new closed bar signal.
-            pos = get_open_position(conn)
-            last_processed_signal_ts = db_get(conn, "last_signal_bar_utc", "")
             closed_ts_iso = closed_ts.replace(tzinfo=timezone.utc).isoformat()
 
-            if pos is None and last_processed_signal_ts != closed_ts_iso:
-                signals = combined_signals(df, S5_PARAMS)
-                LOGGER.debug("generated signals count=%s closed_idx=%s", len(signals), closed_idx)
-                target = [s for s in signals if int(s["bar"]) == closed_idx]
-                if target:
-                    s = target[0]
-                    direction = int(s["direction"])
-                    side = "long" if direction == 1 else "short"
-                    entry_raw = float(df["open"].iloc[open_idx])
-                    entry_px = apply_slippage(entry_raw, direction, is_entry=True)
-                    stop_px = float(s["stop"])
-                    tp_px = float(s["tp"])
+            for strategy_id in ACTIVE_STRATEGIES:
+                pos = get_open_position(conn, cfg.symbol, strategy_id)
+                if pos is not None:
+                    side = pos["side"]
+                    stop_px = float(pos["stop_price"])
+                    tp_px = float(pos["tp_price"])
+                    entry_px = float(pos["entry_price"])
 
-                    if entry_px > 0 and stop_px > 0 and tp_px > 0:
-                        open_position(
-                            conn=conn,
-                            cfg=cfg,
-                            side=side,
-                            entry_time=current_open_ts,
-                            entry_price=entry_px,
-                            stop_price=stop_px,
-                            tp_price=tp_px,
-                            signal_bar_time=closed_ts,
-                        )
+                    low = float(df["low"].iloc[closed_idx])
+                    high = float(df["high"].iloc[closed_idx])
+                    close = float(df["close"].iloc[closed_idx])
+
+                    raw_exit = None
+                    reason = None
+                    if side == "long":
+                        hit_sl = low <= stop_px
+                        hit_tp = high >= tp_px
+                        if hit_sl and hit_tp:
+                            raw_exit, reason = stop_px, "both_hit_stop_first"
+                        elif hit_sl:
+                            raw_exit, reason = stop_px, "stop"
+                        elif hit_tp:
+                            raw_exit, reason = tp_px, "tp"
+                    else:
+                        hit_sl = high >= stop_px
+                        hit_tp = low <= tp_px
+                        if hit_sl and hit_tp:
+                            raw_exit, reason = stop_px, "both_hit_stop_first"
+                        elif hit_sl:
+                            raw_exit, reason = stop_px, "stop"
+                        elif hit_tp:
+                            raw_exit, reason = tp_px, "tp"
+
+                    if raw_exit is None and strategy_id == "ict_killzone_opt3":
+                        if should_force_flat_after_ny(pd.Timestamp(closed_ts), KILLZONE_PARAMS):
+                            raw_exit, reason = close, "flat_after_ny"
+
+                    if raw_exit is not None:
+                        direction = 1 if side == "long" else -1
+                        exit_px = apply_slippage(raw_exit, direction, is_entry=False)
+                        pnl = close_position(conn, cfg, int(pos["id"]), side, entry_px, exit_px, reason)
                         msg = (
-                            f"✅ 開倉成功\n"
+                            f"💰 平倉\n"
                             f"幣種: {cfg.symbol}\n"
+                            f"策略: {strategy_name(strategy_id)}\n"
                             f"方向: {'做多' if side == 'long' else '做空'}\n"
-                            f"進場價: {entry_px:.4f}\n"
-                            f"止損價: {stop_px:.4f}\n"
-                            f"止盈價: {tp_px:.4f}\n"
-                            f"策略: S5 (BOS+FVG+RSI, RR=1.5)\n"
+                            f"原因: {reason}\n"
+                            f"進場: {entry_px:.4f}\n"
+                            f"出場: {exit_px:.4f}\n"
+                            f"盈虧: {pnl:+.2f} USDT\n"
                             f"時間: {fmt_ts(now_utc())}"
                         )
-                        log_event(conn, "TRADE_ENTRY", msg)
+                        log_event(conn, "TRADE_EXIT", msg)
                         send_telegram(cfg, msg)
 
-                db_set(conn, "last_signal_bar_utc", closed_ts_iso)
-            else:
-                LOGGER.debug("no new signal processed flat=%s last_signal=%s", pos is None, last_processed_signal_ts)
+                pos = get_open_position(conn, cfg.symbol, strategy_id)
+                last_signal_key = f"last_signal_bar_utc:{strategy_id}"
+                last_processed_signal_ts = db_get(conn, last_signal_key, "")
+
+                if pos is None and last_processed_signal_ts != closed_ts_iso:
+                    signals = strategy_signals(df, strategy_id)
+                    LOGGER.debug(
+                        "generated signals strategy=%s count=%s closed_idx=%s",
+                        strategy_id,
+                        len(signals),
+                        closed_idx,
+                    )
+                    target = [s for s in signals if int(s["bar"]) == open_idx]
+                    if target:
+                        s = target[0]
+                        direction = int(s["direction"])
+                        side = "long" if direction == 1 else "short"
+                        entry_raw = float(df["open"].iloc[open_idx])
+                        entry_px = apply_slippage(entry_raw, direction, is_entry=True)
+                        stop_px = float(s["stop"])
+                        tp_px = float(s["tp"])
+                        setup_session = str(s.get("setup_session", ""))
+                        setup_type = str(s.get("setup_type", ""))
+
+                        if entry_px > 0 and stop_px > 0 and tp_px > 0:
+                            open_position(
+                                conn=conn,
+                                cfg=cfg,
+                                strategy_id=strategy_id,
+                                side=side,
+                                entry_time=current_open_ts,
+                                entry_price=entry_px,
+                                stop_price=stop_px,
+                                tp_price=tp_px,
+                                signal_bar_time=closed_ts,
+                                setup_session=setup_session,
+                                setup_type=setup_type,
+                            )
+                            msg = (
+                                f"✅ 開倉成功\n"
+                                f"幣種: {cfg.symbol}\n"
+                                f"策略: {strategy_name(strategy_id)}\n"
+                                f"方向: {'做多' if side == 'long' else '做空'}\n"
+                                f"進場價: {entry_px:.4f}\n"
+                                f"止損價: {stop_px:.4f}\n"
+                                f"止盈價: {tp_px:.4f}\n"
+                                f"Setup: {setup_session or '-'} / {setup_type or '-'}\n"
+                                f"時間: {fmt_ts(now_utc())}"
+                            )
+                            log_event(conn, "TRADE_ENTRY", msg)
+                            send_telegram(cfg, msg)
+
+                    db_set(conn, last_signal_key, closed_ts_iso)
+                else:
+                    LOGGER.debug(
+                        "no new signal processed strategy=%s flat=%s last_signal=%s",
+                        strategy_id,
+                        pos is None,
+                        last_processed_signal_ts,
+                    )
 
             # 3) heartbeat
             last_hb = db_get(conn, "last_heartbeat_utc", "")
