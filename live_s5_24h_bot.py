@@ -27,8 +27,94 @@ from research import combined_signals
 from live_practical_session_report import apply_slippage
 from ict_killzone_opt3_core import DEFAULT_PARAMS as KILLZONE_PARAMS
 from ict_killzone_opt3_core import killzone_opt3_signals, should_force_flat_after_ny
-from intraday_edge_hunt import add_indicators as add_edge_indicators
-from intraday_edge_hunt import build_conditions
+
+try:
+    from intraday_edge_hunt import add_indicators as add_edge_indicators
+    from intraday_edge_hunt import build_conditions
+except ModuleNotFoundError:
+    def add_edge_indicators(df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        close = out["close"]
+        high = out["high"]
+        low = out["low"]
+        volume = out["volume"]
+
+        out["ema20"] = close.ewm(span=20, adjust=False).mean()
+        out["ema50"] = close.ewm(span=50, adjust=False).mean()
+        out["ema200"] = close.ewm(span=200, adjust=False).mean()
+        out["ema20_slope"] = out["ema20"].diff(3)
+        out["ema50_slope"] = out["ema50"].diff(5)
+
+        delta = close.diff()
+        gain = delta.clip(lower=0).ewm(span=14, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).ewm(span=14, adjust=False).mean()
+        out["rsi14"] = 100 - 100 / (1 + gain / (loss + 1e-9))
+
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        macd = ema12 - ema26
+        signal = macd.ewm(span=9, adjust=False).mean()
+        out["macd_hist"] = macd - signal
+        out["macd_hist_d1"] = out["macd_hist"].diff(1)
+
+        prev_close = close.shift(1)
+        true_range = pd.concat(
+            [high - low, (high - prev_close).abs(), (low - prev_close).abs()],
+            axis=1,
+        ).max(axis=1)
+        out["atr14"] = true_range.ewm(span=14, adjust=False).mean()
+        out["atr_pct"] = out["atr14"] / close
+
+        out["vol_ratio"] = volume / (volume.rolling(20).mean() + 1e-9)
+        out["hh20_prev"] = high.shift(1).rolling(20).max()
+        out["ll20_prev"] = low.shift(1).rolling(20).min()
+
+        out["hour"] = out.index.hour
+        out["session_asia"] = out["hour"].between(0, 7)
+        out["session_london"] = out["hour"].between(8, 12)
+        out["session_overlap"] = out["hour"].between(13, 16)
+        out["session_ny"] = out["hour"].between(17, 21)
+        return out
+
+
+    def build_conditions(df: pd.DataFrame):
+        median_atr = df["atr_pct"].rolling(200).median()
+
+        long_conditions = {
+            "trend_up": (df["ema20"] > df["ema50"]) & (df["ema50"] > df["ema200"]),
+            "trend_up_soft": df["ema20"] > df["ema50"],
+            "ema_slope_up": (df["ema20_slope"] > 0) & (df["ema50_slope"] > 0),
+            "pullback_near_ema20": (df["close"] < df["ema20"] * 1.003)
+            & (df["close"] > df["ema50"] * 0.997),
+            "rsi_reclaim_50": (df["rsi14"].shift(1) <= 50) & (df["rsi14"] > 50),
+            "rsi_mid_up": df["rsi14"].between(50, 62),
+            "macd_turn_up": (df["macd_hist"] < 0) & (df["macd_hist_d1"] > 0),
+            "macd_positive": df["macd_hist"] > 0,
+            "breakout_20h": df["close"] > df["hh20_prev"],
+            "vol_expand": df["vol_ratio"] > 1.2,
+            "high_vol": df["atr_pct"] > median_atr,
+            "session_overlap": df["session_overlap"],
+            "session_ny": df["session_ny"],
+        }
+
+        short_conditions = {
+            "trend_down": (df["ema20"] < df["ema50"]) & (df["ema50"] < df["ema200"]),
+            "trend_down_soft": df["ema20"] < df["ema50"],
+            "ema_slope_down": (df["ema20_slope"] < 0) & (df["ema50_slope"] < 0),
+            "pullup_near_ema20": (df["close"] > df["ema20"] * 0.997)
+            & (df["close"] < df["ema50"] * 1.003),
+            "rsi_lose_50": (df["rsi14"].shift(1) >= 50) & (df["rsi14"] < 50),
+            "rsi_mid_down": df["rsi14"].between(38, 50),
+            "macd_turn_down": (df["macd_hist"] > 0) & (df["macd_hist_d1"] < 0),
+            "macd_negative": df["macd_hist"] < 0,
+            "breakdown_20h": df["close"] < df["ll20_prev"],
+            "vol_expand": df["vol_ratio"] > 1.2,
+            "high_vol": df["atr_pct"] > median_atr,
+            "session_overlap": df["session_overlap"],
+            "session_ny": df["session_ny"],
+        }
+
+        return long_conditions, short_conditions
 
 
 BINANCE_KLINES_URLS = (
