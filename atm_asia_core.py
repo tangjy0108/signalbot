@@ -111,6 +111,7 @@ class ATMContext:
     interaction:      Optional[InteractionType] = None
     bias:             Optional[Bias] = None
     ob:               Optional[OrderBlock] = None
+    displaced:        bool = False             # True once price moves away from OB after interaction
     entry:            Optional[float] = None
     sl:               Optional[float] = None
     tp1:              Optional[float] = None   # Asia High/Low target
@@ -321,24 +322,36 @@ def process_candle(
                 log.info(f"[ATM] OB  H={ob.high:.2f}  L={ob.low:.2f}")
         return None
 
-    # ── Phase 3: wait for price to return to OB ──────────────────
+    # ── Phase 3: wait for displacement then retest ───────────────
     if ctx.state == ATMState.WAITING_RETEST:
         if ob_invalidated(candle, ctx.ob):
             log.warning("[ATM] OB invalidated — trying Reversal OB")
             rev_bias = Bias.SHORT if ctx.bias == Bias.LONG else Bias.LONG
             rev_ob   = find_ob(history, rev_bias, lookback=5)
             if rev_ob:
-                ctx.bias = rev_bias
-                ctx.ob   = rev_ob
+                ctx.bias     = rev_bias
+                ctx.ob       = rev_ob
+                ctx.displaced = False
                 log.info(f"[ATM] Reversal OB  H={rev_ob.high:.2f}  L={rev_ob.low:.2f}")
             else:
                 ctx.reset()
             return None
 
+        # Step A: wait for displacement away from OB before accepting a retest
+        if not ctx.displaced:
+            if ctx.bias == Bias.LONG and candle.close > ctx.ob.high:
+                ctx.displaced = True
+                log.info(f"[ATM] Displacement confirmed (close={candle.close:.2f} > OB.high={ctx.ob.high:.2f})")
+            elif ctx.bias == Bias.SHORT and candle.close < ctx.ob.low:
+                ctx.displaced = True
+                log.info(f"[ATM] Displacement confirmed (close={candle.close:.2f} < OB.low={ctx.ob.low:.2f})")
+            return None
+
+        # Step B: price returns to OB zone after displacement
         if is_in_ob_zone(candle, ctx.ob):
             ctx.state = ATMState.WAITING_WICK
             ctx.checklist["retest"] = True
-            log.info(f"[ATM] Price entered OB zone @ {candle.close:.2f}")
+            log.info(f"[ATM] Price retested OB zone @ {candle.close:.2f}")
         return None
 
     # ── Phase 4: wick rejection → fire signal ───────────────────
@@ -477,14 +490,11 @@ def build_ob_found_msg(ctx: ATMContext) -> str:
 # Daily reset — call at 05:55 TW (summer) / 06:55 TW (winter)
 # ─────────────────────────────────────────────────────────────────
 def should_daily_reset(ctx: ATMContext, now_tw: datetime) -> bool:
-    windows = kill_zone_windows(now_tw)
+    """Reset 5 minutes before Asia Kill Zone opens — unconditional, every day."""
+    windows      = kill_zone_windows(now_tw)
     reset_hour   = windows["asia_start"].hour
     reset_minute = windows["asia_start"].minute - 5
     if reset_minute < 0:
-        reset_hour -= 1
+        reset_hour  -= 1
         reset_minute += 60
-    return (
-        now_tw.hour == reset_hour
-        and now_tw.minute == reset_minute
-        and ctx.state not in (ATMState.WAITING_WICK, ATMState.WAITING_RETEST)
-    )
+    return now_tw.hour == reset_hour and now_tw.minute == reset_minute
