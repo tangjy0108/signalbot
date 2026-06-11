@@ -1,7 +1,7 @@
 """
 ATM Model — Asia Session Strategy
 Based on Adamtrade ATM Model + ICT SMC concepts
-Exchange: BINGx | Symbol: NQ-USDT (env: ATM_SYMBOL)
+Exchange: BINGx | Symbol: NCSINASDAQ1002USD-USDT (env: ATM_SYMBOL)
 Timeframe: 1m (Asia Kill Zone 06:00-07:00 TW), 5m (Tokyo Kill Zone 09:00-10:00 TW)
 Winter time (US DST off, Nov~Mar): all windows shift +1h automatically
 """
@@ -22,7 +22,7 @@ log = logging.getLogger("atm_asia")
 # Config
 # ─────────────────────────────────────────────────────────────────
 TW_TZ      = ZoneInfo("Asia/Taipei")
-SYMBOL     = os.getenv("ATM_SYMBOL", "NQ-USDT")
+SYMBOL     = os.getenv("ATM_SYMBOL", "NCSINASDAQ1002USD-USDT")
 BINGX_BASE = "https://open-api.bingx.com"
 USE_MOCK   = os.getenv("ATM_USE_MOCK", "0") == "1"   # set "1" to use mock data for testing
 
@@ -140,16 +140,22 @@ def fetch_klines(symbol: str, interval: str, limit: int = 120) -> List[Candle]:
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     r = requests.get(url, params=params, timeout=10)
     r.raise_for_status()
-    rows = r.json().get("data", [])
-    return [
+    payload = r.json()
+    if payload.get("code") != 0:
+        raise RuntimeError(f"BINGx error code={payload.get('code')} msg={payload.get('msg')}")
+    rows = payload.get("data", [])
+    candles = sorted([
         Candle(
-            ts=datetime.fromtimestamp(int(row[0]) / 1000, tz=TW_TZ),
-            open=float(row[1]), high=float(row[2]),
-            low=float(row[3]),  close=float(row[4]),
-            volume=float(row[5]) if len(row) > 5 else 0.0,
+            ts=datetime.fromtimestamp(int(row["time"]) / 1000, tz=TW_TZ),
+            open=float(row["open"]), high=float(row["high"]),
+            low=float(row["low"]),   close=float(row["close"]),
+            volume=float(row.get("volume", 0)),
         )
-        for row in rows
-    ]
+        for row in rows if isinstance(row, dict)
+    ], key=lambda c: c.ts)
+    log.info("✅ [ATM] fetch OK symbol=%s interval=%s bars=%s latest_close=%.2f",
+             symbol, interval, len(candles), candles[-1].close if candles else 0)
+    return candles
 
 
 # ─────────────────────────────────────────────────────────────────

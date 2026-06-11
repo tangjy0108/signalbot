@@ -122,6 +122,21 @@ BINANCE_KLINES_URLS = (
     "https://data-api.binance.vision/api/v3/klines",
 )
 BITGET_KLINES_URL = "https://api.bitget.com/api/v2/mix/market/candles"
+BINGX_KLINES_URL  = "https://open-api.bingx.com/openApi/swap/v2/quote/klines"
+
+# Display name → actual BINGx perpetual contract symbol
+BINGX_SYMBOL_MAP: dict[str, str] = {
+    "NASDAQ100USD": "NCSINASDAQ1002USD-USDT",
+    "SP500USD":     "NCSISP5002USD-USDT",
+    "DOWJONESUSD":  "NCSIDOWJONES2USD-USDT",
+}
+
+def to_bingx_symbol(symbol: str) -> str:
+    if symbol in BINGX_SYMBOL_MAP:
+        return BINGX_SYMBOL_MAP[symbol]
+    if symbol.endswith("USDT"):
+        return symbol[:-4] + "-USDT"
+    return symbol
 
 S5_PARAMS = {
     "lookback": 10,
@@ -207,7 +222,7 @@ setup_logging()
 
 @dataclass
 class Config:
-    exchange: str = os.getenv("BOT_EXCHANGE", "binance").strip().lower()
+    exchange: str = os.getenv("BOT_EXCHANGE", "bingx").strip().lower()
     symbol: str = (
         os.getenv("BOT_SYMBOL")
         or os.getenv("BOT_SYMBOLS", "BTCUSDT").split(",")[0].strip()
@@ -481,11 +496,57 @@ def fetch_bitget_klines(cfg: Config) -> pd.DataFrame:
     return df.set_index("timestamp").sort_index()
 
 
+def fetch_bingx_klines(cfg: Config) -> pd.DataFrame:
+    bingx_sym = to_bingx_symbol(cfg.symbol)
+    LOGGER.debug(
+        "fetching BINGx klines symbol=%s (%s) interval=%s limit=%s",
+        cfg.symbol, bingx_sym, cfg.interval, cfg.kline_limit,
+    )
+    r = requests.get(
+        BINGX_KLINES_URL,
+        params={
+            "symbol":   bingx_sym,
+            "interval": cfg.interval,
+            "limit":    min(cfg.kline_limit, 1000),
+        },
+        timeout=20,
+    )
+    r.raise_for_status()
+    payload = r.json()
+    if payload.get("code") != 0:
+        raise RuntimeError(
+            f"BINGx API error code={payload.get('code')} msg={payload.get('msg', '')}"
+        )
+
+    rows = payload.get("data") or []
+    parsed_rows = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        parsed_rows.append({
+            "timestamp": pd.to_datetime(int(row["time"]), unit="ms", utc=True),
+            "open":   pd.to_numeric(row.get("open"),   errors="coerce"),
+            "high":   pd.to_numeric(row.get("high"),   errors="coerce"),
+            "low":    pd.to_numeric(row.get("low"),    errors="coerce"),
+            "close":  pd.to_numeric(row.get("close"),  errors="coerce"),
+            "volume": pd.to_numeric(row.get("volume"), errors="coerce"),
+        })
+
+    df = pd.DataFrame(parsed_rows)
+    if df.empty:
+        raise RuntimeError(f"BINGx returned no usable candle data for {bingx_sym}")
+
+    df = df.dropna().drop_duplicates(subset=["timestamp"])
+    return df.set_index("timestamp").sort_index()
+
+
 def fetch_klines(cfg: Config) -> pd.DataFrame:
     if cfg.exchange == "binance":
         return fetch_binance_klines(cfg)
     if cfg.exchange == "bitget":
         return fetch_bitget_klines(cfg)
+    if cfg.exchange == "bingx":
+        return fetch_bingx_klines(cfg)
     raise ValueError(f"unsupported BOT_EXCHANGE: {cfg.exchange}")
 
 
@@ -655,7 +716,7 @@ def main():
         cfg,
         f"❤️ S5 + ATM 機器人啟動\n"
         f"S5 標的: {cfg.symbol} ({cfg.interval})\n"
-        f"ATM 標的: {os.getenv('ATM_SYMBOL', 'NQ-USDT')} (BINGx 亞洲盤)\n"
+        f"ATM 標的: {os.getenv('ATM_SYMBOL', 'NCSINASDAQ1002USD-USDT')} (BINGx 亞洲盤)\n"
         f"版本: ATM {ATM_VERSION}\n"
         f"時間: {fmt_ts(now_utc())}"
     )
@@ -664,12 +725,20 @@ def main():
         try:
             tick_started = time.time()
             df = fetch_klines(cfg)
+            LOGGER.info(
+                "✅ 資料取得成功 exchange=%s symbol=%s bars=%s latest_ts=%s close=%.4f",
+                cfg.exchange,
+                cfg.symbol,
+                len(df),
+                df.index[-1].isoformat() if not df.empty else "N/A",
+                float(df["close"].iloc[-1]) if not df.empty else 0.0,
+            )
             if len(df) < 220:
                 LOGGER.warning("insufficient bars=%s, sleeping %ss", len(df), cfg.loop_seconds)
                 time.sleep(cfg.loop_seconds)
                 continue
 
-            # Binance returns the current in-progress candle as the last row.
+            # last row is the current in-progress candle
             closed_idx = len(df) - 2
             open_idx = len(df) - 1
             closed_ts = df.index[closed_idx].to_pydatetime()
