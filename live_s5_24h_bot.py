@@ -759,10 +759,17 @@ def main():
                     stop_px = float(pos["stop_price"])
                     tp_px = float(pos["tp_price"])
                     entry_px = float(pos["entry_price"])
+                    entry_bar_ts = pos["entry_time_utc"][:16]  # YYYY-MM-DDTHH:MM
 
                     low = float(df["low"].iloc[closed_idx])
                     high = float(df["high"].iloc[closed_idx])
                     close = float(df["close"].iloc[closed_idx])
+
+                    # Skip SL/TP check on the entry bar itself — price may wick
+                    # briefly through SL/TP on the open bar without truly being hit
+                    if closed_ts.isoformat()[:16] == entry_bar_ts:
+                        LOGGER.debug("skip exit check on entry bar strategy=%s", strategy_id)
+                        continue
 
                     raw_exit = None
                     reason = None
