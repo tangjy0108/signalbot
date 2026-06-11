@@ -842,5 +842,100 @@ def main():
         time.sleep(cfg.loop_seconds)
 
 
+# ─────────────────────────────────────────────────────────────────
+# ATM Asia Strategy — background thread
+# Runs independently from the main crypto loop.
+# Uses BINGx NQ-USDT, 1m (Asia KZ) / 5m (Tokyo KZ), TW time.
+# ─────────────────────────────────────────────────────────────────
+ATM_VERSION = "1.0.0-20260611"
+
+def _atm_thread(cfg: Config) -> None:
+    import threading
+    try:
+        from atm_asia_core import (
+            ATMContext, ATMState, fetch_klines as atm_fetch,
+            process_candle, should_daily_reset,
+            build_range_locked_msg, build_ob_found_msg,
+            kill_zone_windows, SYMBOL as ATM_SYMBOL, TW_TZ,
+        )
+    except ImportError as exc:
+        LOGGER.error("[ATM] failed to import atm_asia_core: %s", exc)
+        return
+
+    LOGGER.info(
+        "[ATM] ✅ ATM Asia Strategy loaded  version=%s  symbol=%s  mock=%s",
+        ATM_VERSION,
+        ATM_SYMBOL,
+        os.getenv("ATM_USE_MOCK", "0"),
+    )
+    send_telegram(
+        cfg,
+        f"🌏 ATM Asia Strategy 已載入 v{ATM_VERSION}\n"
+        f"商品: {ATM_SYMBOL}\n"
+        f"時間: {fmt_ts(now_utc())}",
+    )
+
+    ctx      = ATMContext()
+    history  = []
+    seen_ts  = set()
+    prev_state = ATMState.IDLE
+    loop_sec = int(os.getenv("ATM_LOOP_SECONDS", "60"))
+
+    while True:
+        try:
+            now_tw   = datetime.now(TW_TZ)
+            windows  = kill_zone_windows(now_tw)
+            t        = now_tw.time()
+
+            in_asia  = windows["asia_start"] <= t < windows["asia_end"]
+            in_tokyo = windows["tokyo_start"] <= t < windows["tokyo_end"]
+            post_az  = t >= windows["asia_end"]
+            interval = "1m" if (in_asia or post_az) else "5m" if in_tokyo else "1m"
+
+            if should_daily_reset(ctx, now_tw):
+                LOGGER.info("[ATM] daily reset")
+                ctx.reset()
+                history.clear()
+                seen_ts.clear()
+                prev_state = ATMState.IDLE
+
+            candles = atm_fetch(ATM_SYMBOL, interval, limit=120)
+            for c in candles[:-1]:
+                if c.ts in seen_ts:
+                    continue
+                seen_ts.add(c.ts)
+                history.append(c)
+
+                signal = process_candle(c, ctx, history)
+
+                # state-change notifications
+                if ctx.state != prev_state:
+                    LOGGER.info("[ATM] state %s → %s", prev_state, ctx.state)
+                    if ctx.state == ATMState.ASIA_RANGE_LOCKED:
+                        send_telegram(cfg, build_range_locked_msg(ctx))
+                    elif ctx.state == ATMState.WAITING_RETEST:
+                        send_telegram(cfg, build_ob_found_msg(ctx))
+                    prev_state = ctx.state
+
+                if signal:
+                    LOGGER.info(
+                        "[ATM] SIGNAL %s  entry=%.2f  SL=%.2f  TP1=%.2f  TP2=%.2f",
+                        signal["direction"], signal["entry"],
+                        signal["sl"], signal["tp1"], signal["tp2"],
+                    )
+                    send_telegram(cfg, signal["telegram_message"])
+
+        except Exception as exc:
+            LOGGER.exception("[ATM] loop error: %s", exc)
+            send_telegram(cfg, f"⚠️ ATM 錯誤\n`{type(exc).__name__}: {exc}`")
+
+        time.sleep(loop_sec)
+
+
 if __name__ == "__main__":
+    import threading
+    cfg_main = Config()
+    atm_t = threading.Thread(target=_atm_thread, args=(cfg_main,), daemon=True, name="atm-asia")
+    atm_t.start()
+    LOGGER.info("[MAIN] ATM thread started  thread=%s", atm_t.name)
     main()
