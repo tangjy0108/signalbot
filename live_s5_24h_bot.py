@@ -651,7 +651,14 @@ def main():
             f"strategies={','.join(ACTIVE_STRATEGIES)} loop={cfg.loop_seconds}s db={cfg.db_path} log={cfg.log_path}"
         ),
     )
-    send_telegram(cfg, f"❤️ S5 機器人啟動\n標的: {cfg.symbol}\n週期: {cfg.interval}\n時間: {fmt_ts(now_utc())}")
+    send_telegram(
+        cfg,
+        f"❤️ S5 + ATM 機器人啟動\n"
+        f"S5 標的: {cfg.symbol} ({cfg.interval})\n"
+        f"ATM 標的: {os.getenv('ATM_SYMBOL', 'NQ-USDT')} (BINGx 亞洲盤)\n"
+        f"版本: ATM {ATM_VERSION}\n"
+        f"時間: {fmt_ts(now_utc())}"
+    )
 
     while True:
         try:
@@ -847,7 +854,7 @@ def main():
 # Runs independently from the main crypto loop.
 # Uses BINGx NQ-USDT, 1m (Asia KZ) / 5m (Tokyo KZ), TW time.
 # ─────────────────────────────────────────────────────────────────
-ATM_VERSION = "1.0.0-20260611"
+ATM_VERSION = "1.0.1-20260611"
 
 def _atm_thread(cfg: Config) -> None:
     import threading
@@ -863,16 +870,8 @@ def _atm_thread(cfg: Config) -> None:
         return
 
     LOGGER.info(
-        "[ATM] ✅ ATM Asia Strategy loaded  version=%s  symbol=%s  mock=%s",
-        ATM_VERSION,
-        ATM_SYMBOL,
-        os.getenv("ATM_USE_MOCK", "0"),
-    )
-    send_telegram(
-        cfg,
-        f"🌏 ATM Asia Strategy 已載入 v{ATM_VERSION}\n"
-        f"商品: {ATM_SYMBOL}\n"
-        f"時間: {fmt_ts(now_utc())}",
+        "[ATM] ✅ loaded  version=%s  symbol=%s  mock=%s",
+        ATM_VERSION, ATM_SYMBOL, os.getenv("ATM_USE_MOCK", "0"),
     )
 
     ctx      = ATMContext()

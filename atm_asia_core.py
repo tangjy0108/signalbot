@@ -14,14 +14,14 @@ from datetime import datetime, time, timedelta
 from enum import Enum
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple
-import pytz
+from zoneinfo import ZoneInfo
 
 log = logging.getLogger("atm_asia")
 
 # ─────────────────────────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────────────────────────
-TW_TZ      = pytz.timezone("Asia/Taipei")
+TW_TZ      = ZoneInfo("Asia/Taipei")
 SYMBOL     = os.getenv("ATM_SYMBOL", "NQ-USDT")
 BINGX_BASE = "https://open-api.bingx.com"
 USE_MOCK   = os.getenv("ATM_USE_MOCK", "0") == "1"   # set "1" to use mock data for testing
