@@ -813,10 +813,20 @@ def main():
                         )
                         log_event(conn, "TRADE_EXIT", msg)
                         send_telegram(cfg, msg)
+                        # record close time for cooldown
+                        db_set(conn, f"last_close_utc:{strategy_id}", now_utc().isoformat())
 
                 pos = get_open_position(conn, cfg.symbol, strategy_id)
                 last_signal_key = f"last_signal_bar_utc:{strategy_id}"
                 last_processed_signal_ts = db_get(conn, last_signal_key, "")
+
+                # 1-hour cooldown after last trade close
+                last_close_str = db_get(conn, f"last_close_utc:{strategy_id}", "")
+                if last_close_str:
+                    elapsed = (now_utc() - datetime.fromisoformat(last_close_str)).total_seconds()
+                    if elapsed < 3600:
+                        LOGGER.debug("cooldown active strategy=%s remaining=%.0fs", strategy_id, 3600 - elapsed)
+                        continue
 
                 if pos is None and last_processed_signal_ts != closed_ts_iso:
                     signals = strategy_signals(df, strategy_id)
