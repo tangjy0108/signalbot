@@ -211,16 +211,16 @@ def detect_interaction(
     candle: Candle, asia_high: float, asia_low: float
 ) -> Optional[Tuple[InteractionType, Bias]]:
     """
-    Checks if this candle interacts with Asia Range.
-    Sweep  = wick crosses level, body stays back → reversal bias
-    Breakout = body closes beyond level → continuation bias
+    ATM rule: use CLOSE PRICE (收盤價) to determine Sweep vs Breakout.
+    Sweep    = wick crosses level, close stays back → reversal bias
+    Breakout = close confirms beyond level → continuation bias
     """
     if candle.high > asia_high:
-        if candle.body_high <= asia_high:
+        if candle.close <= asia_high:
             return InteractionType.SWEEP, Bias.SHORT
         return InteractionType.BREAKOUT, Bias.LONG
     if candle.low < asia_low:
-        if candle.body_low >= asia_low:
+        if candle.close >= asia_low:
             return InteractionType.SWEEP, Bias.LONG
         return InteractionType.BREAKOUT, Bias.SHORT
     return None
@@ -245,10 +245,10 @@ def is_in_ob_zone(candle: Candle, ob: OrderBlock) -> bool:
 
 
 def ob_invalidated(candle: Candle, ob: OrderBlock) -> bool:
-    """OB fails when candle body closes through it (strict CHoCH rule)."""
+    """OB fails when close price confirms through it (strict CHoCH rule: 收盤價判斷)."""
     if ob.bias == Bias.LONG:
-        return candle.body_low < ob.low
-    return candle.body_high > ob.high
+        return candle.close < ob.low
+    return candle.close > ob.high
 
 
 def detect_wick_rejection(candle: Candle, ob: OrderBlock) -> bool:
