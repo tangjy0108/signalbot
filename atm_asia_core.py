@@ -117,6 +117,8 @@ class ATMContext:
     tp1:              Optional[float] = None   # Asia High/Low target
     tp2:              Optional[float] = None   # 1:2 R:R target
     signal_sent:      bool = False
+    last_interaction_side: Optional[str] = None
+    interaction_rearmed: bool = False
     checklist: dict = field(default_factory=lambda: {
         "time_filter":   False,
         "asia_range":    False,
@@ -233,6 +235,18 @@ def detect_interaction(
     return None
 
 
+def interaction_side(candle: Candle, asia_high: float, asia_low: float) -> Optional[str]:
+    above = candle.high > asia_high
+    below = candle.low < asia_low
+    if above and below:
+        return "both"
+    if above:
+        return "above"
+    if below:
+        return "below"
+    return None
+
+
 def find_ob(candles: List[Candle], bias: Bias, lookback: int = 10) -> Optional[OrderBlock]:
     """
     Finds the last opposite-color candle before the displacement.
@@ -276,6 +290,48 @@ def detect_wick_rejection(candle: Candle, ob: OrderBlock) -> bool:
         return wick_deep and body_holds and wick_strong
 
 
+def _reset_setup_progress(ctx: ATMContext) -> None:
+    ctx.interaction = None
+    ctx.bias = None
+    ctx.ob = None
+    ctx.displaced = False
+    ctx.entry = None
+    ctx.sl = None
+    ctx.tp1 = None
+    ctx.tp2 = None
+    ctx.signal_sent = False
+    ctx.checklist["interaction"] = False
+    ctx.checklist["ob_found"] = False
+    ctx.checklist["retest"] = False
+    ctx.checklist["wick_rejection"] = False
+
+
+def _start_interaction_setup(
+    candle: Candle,
+    ctx: ATMContext,
+    history: List[Candle],
+    interaction: InteractionType,
+    bias: Bias,
+    side: str,
+) -> None:
+    _reset_setup_progress(ctx)
+    ctx.interaction = interaction
+    ctx.bias = bias
+    ctx.last_interaction_side = side
+    ctx.interaction_rearmed = False
+    ctx.checklist["interaction"] = True
+    log.info(f"[ATM] {ctx.interaction.value} → {ctx.bias.value}")
+    ob = find_ob(history, ctx.bias)
+    if ob:
+        ctx.ob = ob
+        ctx.checklist["ob_found"] = True
+        ctx.state = ATMState.WAITING_RETEST
+        log.info(f"[ATM] OB  H={ob.high:.2f}  L={ob.low:.2f}")
+    else:
+        ctx.state = ATMState.ASIA_RANGE_LOCKED
+        log.warning("[ATM] interaction detected but no OB found")
+
+
 # ─────────────────────────────────────────────────────────────────
 # Main state machine — call this on every closed candle
 # ─────────────────────────────────────────────────────────────────
@@ -317,15 +373,10 @@ def process_candle(
     if ctx.state == ATMState.ASIA_RANGE_LOCKED:
         result = detect_interaction(candle, ctx.asia_high, ctx.asia_low)
         if result:
-            ctx.interaction, ctx.bias = result
-            ctx.checklist["interaction"] = True
-            log.info(f"[ATM] {ctx.interaction.value} → {ctx.bias.value}")
-            ob = find_ob(history, ctx.bias)
-            if ob:
-                ctx.ob = ob
-                ctx.checklist["ob_found"] = True
-                ctx.state = ATMState.WAITING_RETEST
-                log.info(f"[ATM] OB  H={ob.high:.2f}  L={ob.low:.2f}")
+            side = interaction_side(candle, ctx.asia_high, ctx.asia_low)
+            if side:
+                interaction, bias = result
+                _start_interaction_setup(candle, ctx, history, interaction, bias, side)
         return None
 
     # ── Phase 3: wait for displacement then retest ───────────────
@@ -382,21 +433,18 @@ def process_candle(
 
     # ── Phase 5: signal fired — watch for re-breakout ────────────
     if ctx.state == ATMState.SIGNAL_FIRED:
+        side = interaction_side(candle, ctx.asia_high, ctx.asia_low)
+        if side is None:
+            ctx.interaction_rearmed = True
+            return None
+
         re_result = detect_interaction(candle, ctx.asia_high, ctx.asia_low)
-        if re_result:
+        if re_result and (ctx.interaction_rearmed or side != ctx.last_interaction_side):
             new_interaction, new_bias = re_result
             log.info(
-                f"[ATM] Re-breakout → {new_interaction.value} {new_bias.value} "
-                f"— keeping OB H={ctx.ob.high:.2f} L={ctx.ob.low:.2f}"
+                f"[ATM] New Asia interaction after signal → {new_interaction.value} {new_bias.value}"
             )
-            ctx.interaction = new_interaction
-            ctx.bias        = new_bias
-            ctx.displaced   = False
-            ctx.signal_sent = False
-            ctx.state       = ATMState.WAITING_RETEST
-            ctx.checklist["retest"]         = False
-            ctx.checklist["wick_rejection"] = False
-            # ctx.ob intentionally preserved (keep old OB on re-breakout)
+            _start_interaction_setup(candle, ctx, history, new_interaction, new_bias, side)
 
     return None
 
@@ -459,6 +507,10 @@ def _build_signal(ctx: ATMContext, candle: Candle) -> dict:
         "strategy":    "ATM_ASIA",
         "direction":   ctx.bias.value,
         "interaction": ctx.interaction.value,
+        "signal_key":  (
+            f"{ctx.interaction.value}|{ctx.bias.value}|"
+            f"{ctx.ob.source_time.isoformat()}|{candle.ts.isoformat()}"
+        ),
         "entry":       ctx.entry,
         "sl":          ctx.sl,
         "tp1":         ctx.tp1,

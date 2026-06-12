@@ -165,6 +165,9 @@ ACTIVE_STRATEGIES = (
     "edge_breakdown_vol_short",
 )
 
+ATM_STRATEGY_ID = "atm_asia"
+ATM_STRATEGY_NAME = "ATM Asia"
+
 STRATEGY_NAMES = {
     "s5": "S5",
     "ict_killzone_opt3": "ICT Killzone Opt3",
@@ -246,6 +249,12 @@ class Config:
     tg_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     tg_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
+    # ATM monitor
+    atm_monitor_seconds: float = float(os.getenv("ATM_MONITOR_SECONDS", "1"))
+    atm_monitor_interval: str = os.getenv("ATM_MONITOR_INTERVAL", "1m")
+    atm_daily_summary_hour: int = int(os.getenv("ATM_DAILY_SUMMARY_HOUR", "23"))
+    atm_daily_summary_minute: int = int(os.getenv("ATM_DAILY_SUMMARY_MINUTE", "0"))
+
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -309,7 +318,41 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS atm_signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_key TEXT NOT NULL UNIQUE,
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            interaction TEXT NOT NULL,
+            signal_time_utc TEXT NOT NULL,
+            created_time_utc TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            sl_price REAL NOT NULL,
+            tp1_price REAL NOT NULL,
+            tp2_price REAL NOT NULL,
+            rr_tp1 REAL,
+            rr_tp2 REAL,
+            status TEXT NOT NULL DEFAULT 'OPEN',
+            max_favorable_stage INTEGER NOT NULL DEFAULT 0,
+            final_outcome TEXT,
+            close_reason TEXT,
+            close_price REAL,
+            closed_time_utc TEXT,
+            tp1_hit_time_utc TEXT,
+            tp1_hit_price REAL,
+            tp2_hit_time_utc TEXT,
+            tp2_hit_price REAL,
+            sl_hit_time_utc TEXT,
+            sl_hit_price REAL,
+            last_price REAL,
+            last_price_time_utc TEXT
+        )
+        """
+    )
     ensure_position_columns(conn)
+    ensure_atm_signal_columns(conn)
     conn.commit()
 
 
@@ -324,6 +367,47 @@ def ensure_position_columns(conn: sqlite3.Connection) -> None:
     for name, ddl in columns.items():
         if name not in existing:
             conn.execute(f"ALTER TABLE positions ADD COLUMN {name} {ddl}")
+    conn.commit()
+
+
+def ensure_atm_signal_columns(conn: sqlite3.Connection) -> None:
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(atm_signals)").fetchall()}
+    if not existing:
+        return
+    columns = {
+        "signal_key": "TEXT NOT NULL DEFAULT ''",
+        "symbol": "TEXT NOT NULL DEFAULT ''",
+        "direction": "TEXT NOT NULL DEFAULT ''",
+        "interaction": "TEXT NOT NULL DEFAULT ''",
+        "signal_time_utc": "TEXT NOT NULL DEFAULT ''",
+        "created_time_utc": "TEXT NOT NULL DEFAULT ''",
+        "entry_price": "REAL NOT NULL DEFAULT 0",
+        "sl_price": "REAL NOT NULL DEFAULT 0",
+        "tp1_price": "REAL NOT NULL DEFAULT 0",
+        "tp2_price": "REAL NOT NULL DEFAULT 0",
+        "rr_tp1": "REAL",
+        "rr_tp2": "REAL",
+        "status": "TEXT NOT NULL DEFAULT 'OPEN'",
+        "max_favorable_stage": "INTEGER NOT NULL DEFAULT 0",
+        "final_outcome": "TEXT",
+        "close_reason": "TEXT",
+        "close_price": "REAL",
+        "closed_time_utc": "TEXT",
+        "tp1_hit_time_utc": "TEXT",
+        "tp1_hit_price": "REAL",
+        "tp2_hit_time_utc": "TEXT",
+        "tp2_hit_price": "REAL",
+        "sl_hit_time_utc": "TEXT",
+        "sl_hit_price": "REAL",
+        "last_price": "REAL",
+        "last_price_time_utc": "TEXT",
+    }
+    for name, ddl in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE atm_signals ADD COLUMN {name} {ddl}")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_atm_signals_signal_key ON atm_signals(signal_key)"
+    )
     conn.commit()
 
 
@@ -700,6 +784,298 @@ def close_position(
     return pnl
 
 
+def _to_utc_iso(ts: str) -> str:
+    return datetime.fromisoformat(ts).astimezone(timezone.utc).isoformat()
+
+
+def insert_atm_signal(
+    conn: sqlite3.Connection,
+    symbol: str,
+    signal: dict[str, object],
+) -> bool:
+    signal_key = str(signal.get("signal_key") or signal.get("signal_time") or "")
+    if not signal_key:
+        return False
+
+    row = conn.execute(
+        "SELECT 1 FROM atm_signals WHERE signal_key=? LIMIT 1",
+        (signal_key,),
+    ).fetchone()
+    if row is not None:
+        return False
+
+    signal_time_utc = _to_utc_iso(str(signal["signal_time"]))
+    created_time_utc = now_utc().isoformat()
+    conn.execute(
+        """
+        INSERT INTO atm_signals(
+            signal_key, symbol, direction, interaction, signal_time_utc, created_time_utc,
+            entry_price, sl_price, tp1_price, tp2_price, rr_tp1, rr_tp2, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')
+        """,
+        (
+            signal_key,
+            symbol,
+            str(signal["direction"]),
+            str(signal["interaction"]),
+            signal_time_utc,
+            created_time_utc,
+            float(signal["entry"]),
+            float(signal["sl"]),
+            float(signal["tp1"]),
+            float(signal["tp2"]),
+            float(signal.get("rr1") or 0),
+            float(signal.get("rr2") or 0),
+        ),
+    )
+    conn.commit()
+    return True
+
+
+def get_active_atm_signals(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM atm_signals
+        WHERE status IN ('OPEN', 'TP1_HIT')
+        ORDER BY id
+        """
+    ).fetchall()
+    conn.row_factory = None
+    return rows
+
+
+def _atm_hit_levels(row: sqlite3.Row | dict[str, object], price: float) -> tuple[bool, bool, bool]:
+    direction = str(row["direction"]).upper()
+    sl_price = float(row["sl_price"])
+    tp1_price = float(row["tp1_price"])
+    tp2_price = float(row["tp2_price"])
+
+    if direction == "LONG":
+        return price >= tp1_price, price >= tp2_price, price <= sl_price
+    return price <= tp1_price, price <= tp2_price, price >= sl_price
+
+
+def evaluate_atm_signal_progress(
+    row: sqlite3.Row | dict[str, object],
+    price: float,
+    checked_at: datetime,
+) -> dict[str, object]:
+    hit_tp1, hit_tp2, hit_sl = _atm_hit_levels(row, price)
+    checked_at_iso = checked_at.isoformat()
+    updates: dict[str, object] = {}
+    notifications: list[str] = []
+
+    tp1_hit = bool(row["tp1_hit_time_utc"])
+    tp2_hit = bool(row["tp2_hit_time_utc"])
+    sl_hit = bool(row["sl_hit_time_utc"])
+    max_stage = int(row["max_favorable_stage"] or 0)
+
+    def mark_tp1(notify: bool) -> None:
+        nonlocal tp1_hit, max_stage
+        if tp1_hit:
+            return
+        updates["tp1_hit_time_utc"] = checked_at_iso
+        updates["tp1_hit_price"] = float(price)
+        updates["status"] = "TP1_HIT"
+        updates["max_favorable_stage"] = max(max_stage, 1)
+        tp1_hit = True
+        max_stage = max(max_stage, 1)
+        if notify:
+            notifications.append("TP1")
+
+    def finalize_tp2() -> None:
+        nonlocal tp2_hit, max_stage
+        if not tp1_hit:
+            mark_tp1(notify=False)
+        if tp2_hit:
+            return
+        updates["tp2_hit_time_utc"] = checked_at_iso
+        updates["tp2_hit_price"] = float(price)
+        updates["status"] = "CLOSED"
+        updates["max_favorable_stage"] = 2
+        updates["final_outcome"] = "TP2"
+        updates["close_reason"] = "TP2"
+        updates["close_price"] = float(price)
+        updates["closed_time_utc"] = checked_at_iso
+        tp2_hit = True
+        max_stage = 2
+        notifications.append("TP2")
+
+    def finalize_sl() -> None:
+        nonlocal sl_hit
+        if not sl_hit:
+            updates["sl_hit_time_utc"] = checked_at_iso
+            updates["sl_hit_price"] = float(price)
+            sl_hit = True
+            notifications.append("SL")
+        if max_stage >= 2 or tp2_hit:
+            final_outcome = "TP2"
+            close_reason = "SL_AFTER_TP2"
+        elif max_stage >= 1 or tp1_hit:
+            final_outcome = "TP1"
+            close_reason = "SL_AFTER_TP1"
+        else:
+            final_outcome = "SL"
+            close_reason = "SL"
+        updates["status"] = "CLOSED"
+        updates["final_outcome"] = final_outcome
+        updates["close_reason"] = close_reason
+        updates["close_price"] = float(price)
+        updates["closed_time_utc"] = checked_at_iso
+
+    if hit_tp2 and not tp2_hit:
+        finalize_tp2()
+        return {"updates": updates, "notifications": notifications}
+
+    if hit_tp1 and not tp1_hit:
+        mark_tp1(notify=True)
+
+    if hit_sl and not sl_hit:
+        finalize_sl()
+
+    return {"updates": updates, "notifications": notifications}
+
+
+def update_atm_signal_row(conn: sqlite3.Connection, signal_id: int, updates: dict[str, object]) -> None:
+    if not updates:
+        return
+    columns = list(updates.keys())
+    sql = ", ".join(f"{col}=?" for col in columns)
+    values = [updates[col] for col in columns]
+    values.append(signal_id)
+    conn.execute(f"UPDATE atm_signals SET {sql} WHERE id=?", values)
+    conn.commit()
+
+
+def build_atm_progress_message(
+    row: sqlite3.Row,
+    level: str,
+    price: float,
+    updates: dict[str, object],
+) -> str:
+    direction = "📈 LONG" if str(row["direction"]).upper() == "LONG" else "📉 SHORT"
+    signal_time = str(row["signal_time_utc"]).replace("T", " ")[:19]
+    final_outcome = str(updates.get("final_outcome") or "")
+
+    if level == "TP1":
+        return (
+            f"🎯 ATM TP1 已達成\n"
+            f"方向: {direction}\n"
+            f"標的: {row['symbol']}\n"
+            f"目前價: `{price:.2f}`\n"
+            f"TP1: `{float(row['tp1_price']):.2f}`\n"
+            f"TP2: `{float(row['tp2_price']):.2f}`\n"
+            f"SL: `{float(row['sl_price']):.2f}`\n"
+            f"訊號時間: {signal_time}\n"
+            f"狀態: 已達 TP1，繼續監看 TP2 / SL"
+        )
+    if level == "TP2":
+        return (
+            f"🏁 ATM TP2 已達成\n"
+            f"方向: {direction}\n"
+            f"標的: {row['symbol']}\n"
+            f"目前價: `{price:.2f}`\n"
+            f"本筆結果: `{final_outcome or 'TP2'}`\n"
+            f"訊號時間: {signal_time}"
+        )
+    if final_outcome == "TP1":
+        return (
+            f"🛑 ATM SL 已觸發\n"
+            f"方向: {direction}\n"
+            f"標的: {row['symbol']}\n"
+            f"目前價: `{price:.2f}`\n"
+            f"本筆結果仍記為: `TP1`\n"
+            f"原因: 先到 TP1，之後才碰到 SL"
+        )
+    if final_outcome == "TP2":
+        return (
+            f"🛑 ATM SL 已觸發\n"
+            f"方向: {direction}\n"
+            f"標的: {row['symbol']}\n"
+            f"目前價: `{price:.2f}`\n"
+            f"本筆結果仍記為: `TP2`\n"
+            f"原因: 先到 TP2，之後才碰到 SL"
+        )
+    return (
+        f"🛑 ATM SL 已達成\n"
+        f"方向: {direction}\n"
+        f"標的: {row['symbol']}\n"
+        f"目前價: `{price:.2f}`\n"
+        f"SL: `{float(row['sl_price']):.2f}`\n"
+        f"本筆結果: `SL`"
+    )
+
+
+def fetch_atm_live_price(symbol: str, interval: str) -> float:
+    r = requests.get(
+        BINGX_KLINES_URL,
+        params={"symbol": symbol, "interval": interval, "limit": 2},
+        timeout=10,
+    )
+    r.raise_for_status()
+    payload = r.json()
+    if payload.get("code") != 0:
+        raise RuntimeError(f"BINGx error code={payload.get('code')} msg={payload.get('msg')}")
+    rows = payload.get("data", [])
+    if not rows:
+        raise RuntimeError("empty BINGx price payload")
+    latest = rows[-1]
+    if not isinstance(latest, dict) or "close" not in latest:
+        raise RuntimeError("unexpected BINGx price payload")
+    return float(latest["close"])
+
+
+def atm_signal_stats(conn: sqlite3.Connection, where_sql: str = "", params: tuple[object, ...] = ()) -> sqlite3.Row:
+    conn.row_factory = sqlite3.Row
+    sql = f"""
+        SELECT
+            COUNT(*) AS signals,
+            SUM(CASE WHEN final_outcome IS NOT NULL THEN 1 ELSE 0 END) AS closed_signals,
+            SUM(CASE WHEN final_outcome IN ('TP1', 'TP2') THEN 1 ELSE 0 END) AS wins,
+            SUM(CASE WHEN final_outcome='SL' THEN 1 ELSE 0 END) AS final_sl,
+            SUM(CASE WHEN final_outcome='TP1' THEN 1 ELSE 0 END) AS final_tp1,
+            SUM(CASE WHEN final_outcome='TP2' THEN 1 ELSE 0 END) AS final_tp2,
+            SUM(CASE WHEN tp1_hit_time_utc IS NOT NULL THEN 1 ELSE 0 END) AS hit_tp1,
+            SUM(CASE WHEN tp2_hit_time_utc IS NOT NULL THEN 1 ELSE 0 END) AS hit_tp2,
+            SUM(CASE WHEN sl_hit_time_utc IS NOT NULL THEN 1 ELSE 0 END) AS hit_sl,
+            SUM(CASE WHEN status IN ('OPEN', 'TP1_HIT') THEN 1 ELSE 0 END) AS open_signals
+        FROM atm_signals
+        {where_sql}
+    """
+    row = conn.execute(sql, params).fetchone()
+    conn.row_factory = None
+    return row
+
+
+def build_atm_summary_message(conn: sqlite3.Connection, now_tw: datetime) -> str:
+    today_tw = now_tw.strftime("%Y-%m-%d")
+    overall = atm_signal_stats(conn)
+    today = atm_signal_stats(
+        conn,
+        "WHERE date(signal_time_utc, '+8 hours') = ?",
+        (today_tw,),
+    )
+
+    def win_rate(row: sqlite3.Row) -> float:
+        closed = int(row["closed_signals"] or 0)
+        wins = int(row["wins"] or 0)
+        return round((wins / closed * 100), 1) if closed else 0.0
+
+    return (
+        f"📊 ATM 夜間統計 {today_tw}\n"
+        f"今日 signals: {int(today['signals'] or 0)}  已完成: {int(today['closed_signals'] or 0)}  開放中: {int(today['open_signals'] or 0)}\n"
+        f"今日勝率: {win_rate(today):.1f}%  (TP1/TP2 視為 win)\n"
+        f"今日最終結果: TP2 {int(today['final_tp2'] or 0)} / TP1 {int(today['final_tp1'] or 0)} / SL {int(today['final_sl'] or 0)}\n"
+        f"今日觸及次數: TP1 {int(today['hit_tp1'] or 0)} / TP2 {int(today['hit_tp2'] or 0)} / SL {int(today['hit_sl'] or 0)}\n"
+        f"歷史 signals: {int(overall['signals'] or 0)}  已完成: {int(overall['closed_signals'] or 0)}\n"
+        f"歷史勝率: {win_rate(overall):.1f}%\n"
+        f"歷史最終結果: TP2 {int(overall['final_tp2'] or 0)} / TP1 {int(overall['final_tp1'] or 0)} / SL {int(overall['final_sl'] or 0)}\n"
+        f"歷史觸及次數: TP1 {int(overall['hit_tp1'] or 0)} / TP2 {int(overall['hit_tp2'] or 0)} / SL {int(overall['hit_sl'] or 0)}"
+    )
+
+
 def main():
     cfg = Config()
     conn = sqlite3.connect(cfg.db_path)
@@ -709,7 +1085,8 @@ def main():
         "INFO",
         (
             f"bot started exchange={cfg.exchange} symbol={cfg.symbol} interval={cfg.interval} "
-            f"strategies={','.join(ACTIVE_STRATEGIES)} loop={cfg.loop_seconds}s db={cfg.db_path} log={cfg.log_path}"
+            f"strategies={','.join(ACTIVE_STRATEGIES)} loop={cfg.loop_seconds}s "
+            f"atm_monitor={cfg.atm_monitor_seconds}s db={cfg.db_path} log={cfg.log_path}"
         ),
     )
     send_telegram(
@@ -717,6 +1094,7 @@ def main():
         f"❤️ S5 + ATM 機器人啟動\n"
         f"S5 標的: {cfg.symbol} ({cfg.interval})\n"
         f"ATM 標的: {os.getenv('ATM_SYMBOL', 'NCSINASDAQ1002USD-USDT')} (BINGx 亞洲盤)\n"
+        f"ATM 追價: 每 {cfg.atm_monitor_seconds:g} 秒檢查 TP1 / TP2 / SL\n"
         f"版本: ATM {ATM_VERSION}\n"
         f"時間: {fmt_ts(now_utc())}"
     )
@@ -940,7 +1318,7 @@ def main():
 # Runs independently from the main crypto loop.
 # Uses BINGx NQ-USDT, 1m (Asia KZ) / 5m (Tokyo KZ), TW time.
 # ─────────────────────────────────────────────────────────────────
-ATM_VERSION = "1.0.1-20260611"
+ATM_VERSION = "1.1.0-20260612"
 
 def _atm_thread(cfg: Config) -> None:
     import threading
@@ -960,10 +1338,13 @@ def _atm_thread(cfg: Config) -> None:
         ATM_VERSION, ATM_SYMBOL, os.getenv("ATM_USE_MOCK", "0"),
     )
 
+    conn = sqlite3.connect(cfg.db_path, timeout=30)
+    init_db(conn)
     ctx      = ATMContext()
     history  = []
     seen_ts  = set()
     prev_state = ATMState.IDLE
+    last_signal_key = ""
     loop_sec = int(os.getenv("ATM_LOOP_SECONDS", "60"))
 
     while True:
@@ -1001,19 +1382,41 @@ def _atm_thread(cfg: Config) -> None:
                 # state-change notifications
                 if ctx.state != prev_state:
                     LOGGER.info("[ATM] state %s → %s", prev_state, ctx.state)
-                    if ctx.state == ATMState.ASIA_RANGE_LOCKED:
+                    if ctx.state == ATMState.ASIA_RANGE_LOCKED and prev_state in {
+                        ATMState.IDLE,
+                        ATMState.ASIA_RANGE_FORMING,
+                    }:
                         send_telegram(cfg, build_range_locked_msg(ctx))
                     elif ctx.state == ATMState.WAITING_RETEST:
                         send_telegram(cfg, build_ob_found_msg(ctx))
                     prev_state = ctx.state
 
                 if signal:
+                    signal_key = str(signal.get("signal_key") or signal.get("signal_time") or "")
+                    if signal_key and signal_key == last_signal_key:
+                        LOGGER.info("[ATM] duplicate signal skipped key=%s", signal_key)
+                        continue
+                    inserted = insert_atm_signal(conn, ATM_SYMBOL, signal)
+                    if not inserted:
+                        LOGGER.info("[ATM] signal already recorded in DB key=%s", signal_key)
+                        last_signal_key = signal_key
+                        continue
                     LOGGER.info(
                         "[ATM] SIGNAL %s  entry=%.2f  SL=%.2f  TP1=%.2f  TP2=%.2f",
                         signal["direction"], signal["entry"],
                         signal["sl"], signal["tp1"], signal["tp2"],
                     )
+                    log_event(
+                        conn,
+                        "INFO",
+                        (
+                            f"[ATM] signal {signal['direction']} key={signal_key} "
+                            f"entry={float(signal['entry']):.2f} sl={float(signal['sl']):.2f} "
+                            f"tp1={float(signal['tp1']):.2f} tp2={float(signal['tp2']):.2f}"
+                        ),
+                    )
                     send_telegram(cfg, signal["telegram_message"])
+                    last_signal_key = signal_key
 
         except Exception as exc:
             LOGGER.exception("[ATM] loop error: %s", exc)
@@ -1022,10 +1425,85 @@ def _atm_thread(cfg: Config) -> None:
         time.sleep(loop_sec)
 
 
+def _atm_monitor_thread(cfg: Config) -> None:
+    from atm_asia_core import SYMBOL as ATM_SYMBOL, TW_TZ
+
+    conn = sqlite3.connect(cfg.db_path, timeout=30)
+    init_db(conn)
+    last_error_message = ""
+    last_error_logged_at = 0.0
+
+    while True:
+        try:
+            now_tw = datetime.now(TW_TZ)
+            summary_key = "atm_daily_summary_sent_date_tw"
+            today_tw = now_tw.strftime("%Y-%m-%d")
+            summary_due = (
+                now_tw.hour > cfg.atm_daily_summary_hour
+                or (
+                    now_tw.hour == cfg.atm_daily_summary_hour
+                    and now_tw.minute >= cfg.atm_daily_summary_minute
+                )
+            )
+            if summary_due and db_get(conn, summary_key, "") != today_tw:
+                summary_msg = build_atm_summary_message(conn, now_tw)
+                send_telegram(cfg, summary_msg)
+                log_event(conn, "INFO", f"[ATM] nightly summary sent date={today_tw}")
+                db_set(conn, summary_key, today_tw)
+
+            active_rows = get_active_atm_signals(conn)
+            if not active_rows:
+                time.sleep(cfg.atm_monitor_seconds)
+                continue
+
+            price = fetch_atm_live_price(ATM_SYMBOL, cfg.atm_monitor_interval)
+            checked_at = now_utc()
+            last_error_message = ""
+
+            for row in active_rows:
+                progress = evaluate_atm_signal_progress(row, price, checked_at)
+                updates = dict(progress["updates"])
+                notifications = list(progress["notifications"])
+                if not updates:
+                    continue
+                updates["last_price"] = float(price)
+                updates["last_price_time_utc"] = checked_at.isoformat()
+                update_atm_signal_row(conn, int(row["id"]), updates)
+                for level in notifications:
+                    msg = build_atm_progress_message(row, level, price, updates)
+                    log_event(
+                        conn,
+                        "INFO",
+                        (
+                            f"[ATM] {level} signal_id={row['id']} price={price:.2f} "
+                            f"final={updates.get('final_outcome') or row['final_outcome'] or ''}"
+                        ),
+                    )
+                    send_telegram(cfg, msg)
+
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            now_mono = time.monotonic()
+            if message != last_error_message or now_mono - last_error_logged_at >= 60:
+                LOGGER.warning("[ATM-MONITOR] %s", message)
+                last_error_message = message
+                last_error_logged_at = now_mono
+
+        time.sleep(cfg.atm_monitor_seconds)
+
+
 if __name__ == "__main__":
     import threading
     cfg_main = Config()
     atm_t = threading.Thread(target=_atm_thread, args=(cfg_main,), daemon=True, name="atm-asia")
     atm_t.start()
+    atm_monitor_t = threading.Thread(
+        target=_atm_monitor_thread,
+        args=(cfg_main,),
+        daemon=True,
+        name="atm-monitor",
+    )
+    atm_monitor_t.start()
     LOGGER.info("[MAIN] ATM thread started  thread=%s", atm_t.name)
+    LOGGER.info("[MAIN] ATM monitor thread started  thread=%s interval=%ss", atm_monitor_t.name, cfg_main.atm_monitor_seconds)
     main()

@@ -31,6 +31,44 @@ def ensure_position_columns(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def ensure_atm_signal_columns(conn: sqlite3.Connection) -> None:
+    if not table_exists(conn, "atm_signals"):
+        return
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(atm_signals)").fetchall()}
+    columns = {
+        "signal_key": "TEXT NOT NULL DEFAULT ''",
+        "symbol": "TEXT NOT NULL DEFAULT ''",
+        "direction": "TEXT NOT NULL DEFAULT ''",
+        "interaction": "TEXT NOT NULL DEFAULT ''",
+        "signal_time_utc": "TEXT NOT NULL DEFAULT ''",
+        "created_time_utc": "TEXT NOT NULL DEFAULT ''",
+        "entry_price": "REAL NOT NULL DEFAULT 0",
+        "sl_price": "REAL NOT NULL DEFAULT 0",
+        "tp1_price": "REAL NOT NULL DEFAULT 0",
+        "tp2_price": "REAL NOT NULL DEFAULT 0",
+        "rr_tp1": "REAL",
+        "rr_tp2": "REAL",
+        "status": "TEXT NOT NULL DEFAULT 'OPEN'",
+        "max_favorable_stage": "INTEGER NOT NULL DEFAULT 0",
+        "final_outcome": "TEXT",
+        "close_reason": "TEXT",
+        "close_price": "REAL",
+        "closed_time_utc": "TEXT",
+        "tp1_hit_time_utc": "TEXT",
+        "tp1_hit_price": "REAL",
+        "tp2_hit_time_utc": "TEXT",
+        "tp2_hit_price": "REAL",
+        "sl_hit_time_utc": "TEXT",
+        "sl_hit_price": "REAL",
+        "last_price": "REAL",
+        "last_price_time_utc": "TEXT",
+    }
+    for name, ddl in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE atm_signals ADD COLUMN {name} {ddl}")
+    conn.commit()
+
+
 def print_rows(title: str, headers: list[str], rows: list[sqlite3.Row]) -> None:
     print(f"\n{title}")
     print("-" * len(title))
@@ -59,6 +97,7 @@ def main() -> None:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     ensure_position_columns(conn)
+    ensure_atm_signal_columns(conn)
 
     if not table_exists(conn, "positions"):
         print(f"No positions table in DB: {DB_PATH}")
@@ -178,6 +217,78 @@ def main() -> None:
             }
         )
 
+    atm_overall_rows = []
+    atm_today_rows = []
+    atm_open_rows = []
+    if table_exists(conn, "atm_signals"):
+        atm_overall = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS signals,
+                SUM(CASE WHEN final_outcome IS NOT NULL THEN 1 ELSE 0 END) AS closed_signals,
+                SUM(CASE WHEN final_outcome IN ('TP1', 'TP2') THEN 1 ELSE 0 END) AS wins,
+                ROUND(
+                    100.0 * SUM(CASE WHEN final_outcome IN ('TP1', 'TP2') THEN 1 ELSE 0 END)
+                    / NULLIF(SUM(CASE WHEN final_outcome IS NOT NULL THEN 1 ELSE 0 END), 0),
+                    1
+                ) AS win_rate_pct,
+                SUM(CASE WHEN final_outcome='SL' THEN 1 ELSE 0 END) AS final_sl,
+                SUM(CASE WHEN final_outcome='TP1' THEN 1 ELSE 0 END) AS final_tp1,
+                SUM(CASE WHEN final_outcome='TP2' THEN 1 ELSE 0 END) AS final_tp2,
+                SUM(CASE WHEN tp1_hit_time_utc IS NOT NULL THEN 1 ELSE 0 END) AS hit_tp1,
+                SUM(CASE WHEN tp2_hit_time_utc IS NOT NULL THEN 1 ELSE 0 END) AS hit_tp2,
+                SUM(CASE WHEN sl_hit_time_utc IS NOT NULL THEN 1 ELSE 0 END) AS hit_sl,
+                SUM(CASE WHEN status IN ('OPEN', 'TP1_HIT') THEN 1 ELSE 0 END) AS open_signals
+            FROM atm_signals
+            """
+        ).fetchone()
+        if atm_overall is not None and int(atm_overall["signals"] or 0) > 0:
+            atm_overall_rows.append(atm_overall)
+
+        atm_today = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS signals,
+                SUM(CASE WHEN final_outcome IS NOT NULL THEN 1 ELSE 0 END) AS closed_signals,
+                SUM(CASE WHEN final_outcome IN ('TP1', 'TP2') THEN 1 ELSE 0 END) AS wins,
+                ROUND(
+                    100.0 * SUM(CASE WHEN final_outcome IN ('TP1', 'TP2') THEN 1 ELSE 0 END)
+                    / NULLIF(SUM(CASE WHEN final_outcome IS NOT NULL THEN 1 ELSE 0 END), 0),
+                    1
+                ) AS win_rate_pct,
+                SUM(CASE WHEN final_outcome='SL' THEN 1 ELSE 0 END) AS final_sl,
+                SUM(CASE WHEN final_outcome='TP1' THEN 1 ELSE 0 END) AS final_tp1,
+                SUM(CASE WHEN final_outcome='TP2' THEN 1 ELSE 0 END) AS final_tp2,
+                SUM(CASE WHEN tp1_hit_time_utc IS NOT NULL THEN 1 ELSE 0 END) AS hit_tp1,
+                SUM(CASE WHEN tp2_hit_time_utc IS NOT NULL THEN 1 ELSE 0 END) AS hit_tp2,
+                SUM(CASE WHEN sl_hit_time_utc IS NOT NULL THEN 1 ELSE 0 END) AS hit_sl,
+                SUM(CASE WHEN status IN ('OPEN', 'TP1_HIT') THEN 1 ELSE 0 END) AS open_signals
+            FROM atm_signals
+            WHERE date(signal_time_utc, '+8 hours') = date('now', '+8 hours')
+            """
+        ).fetchone()
+        if atm_today is not None and int(atm_today["signals"] or 0) > 0:
+            atm_today_rows.append(atm_today)
+
+        atm_open_rows = conn.execute(
+            """
+            SELECT
+                id,
+                symbol,
+                direction,
+                status,
+                ROUND(entry_price, 2) AS entry_price,
+                ROUND(sl_price, 2) AS sl_price,
+                ROUND(tp1_price, 2) AS tp1_price,
+                ROUND(tp2_price, 2) AS tp2_price,
+                signal_time_utc,
+                final_outcome
+            FROM atm_signals
+            WHERE status IN ('OPEN', 'TP1_HIT')
+            ORDER BY id
+            """
+        ).fetchall()
+
     print(f"DB: {DB_PATH}")
     print_rows(
         "Overall Closed Trades",
@@ -219,6 +330,56 @@ def main() -> None:
             "setup_type",
         ],
         open_positions,
+    )
+    print_rows(
+        "ATM Overall",
+        [
+            "signals",
+            "closed_signals",
+            "wins",
+            "win_rate_pct",
+            "final_sl",
+            "final_tp1",
+            "final_tp2",
+            "hit_tp1",
+            "hit_tp2",
+            "hit_sl",
+            "open_signals",
+        ],
+        atm_overall_rows,
+    )
+    print_rows(
+        "ATM Today",
+        [
+            "signals",
+            "closed_signals",
+            "wins",
+            "win_rate_pct",
+            "final_sl",
+            "final_tp1",
+            "final_tp2",
+            "hit_tp1",
+            "hit_tp2",
+            "hit_sl",
+            "open_signals",
+        ],
+        atm_today_rows,
+    )
+    print_rows(
+        "ATM Open Signals",
+        [
+            "id",
+            "symbol",
+            "direction",
+            "status",
+            "entry_price",
+            "sl_price",
+            "tp1_price",
+            "tp2_price",
+            "signal_time_utc",
+            "final_outcome",
+        ],
+        atm_open_rows,
     )
 
 
