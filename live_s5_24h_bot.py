@@ -1384,6 +1384,18 @@ def _atm_thread(cfg: Config) -> None:
                 seen_ts.clear()
                 prev_state = ATMState.IDLE
 
+            # 14:00 TW session timeout — give up if no signal has fired yet
+            if (
+                now_tw.hour == 14
+                and now_tw.minute == 0
+                and ctx.state not in {ATMState.IDLE, ATMState.SIGNAL_FIRED}
+            ):
+                LOGGER.info("[ATM] 14:00 session timeout  state=%s — resetting", ctx.state)
+                ctx.reset()
+                history.clear()
+                seen_ts.clear()
+                prev_state = ATMState.IDLE
+
             candles = atm_fetch(ATM_SYMBOL, interval, limit=120)
             for c in candles[:-1]:
                 if c.ts in seen_ts:
