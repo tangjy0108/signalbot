@@ -1318,7 +1318,7 @@ def main():
 # Runs independently from the main crypto loop.
 # Uses BINGx NQ-USDT, 1m (Asia KZ) / 5m (Tokyo KZ), TW time.
 # ─────────────────────────────────────────────────────────────────
-ATM_VERSION = "1.1.0-20260612"
+ATM_VERSION = "1.1.1-20260612"
 
 def _atm_thread(cfg: Config) -> None:
     import threading
@@ -1327,7 +1327,7 @@ def _atm_thread(cfg: Config) -> None:
             ATMContext, ATMState, fetch_klines as atm_fetch,
             process_candle, should_daily_reset,
             build_range_locked_msg, build_ob_found_msg,
-            kill_zone_windows, SYMBOL as ATM_SYMBOL, TW_TZ,
+            kill_zone_windows, is_trade_day, SYMBOL as ATM_SYMBOL, TW_TZ,
         )
     except ImportError as exc:
         LOGGER.error("[ATM] failed to import atm_asia_core: %s", exc)
@@ -1345,11 +1345,25 @@ def _atm_thread(cfg: Config) -> None:
     seen_ts  = set()
     prev_state = ATMState.IDLE
     last_signal_key = ""
+    weekend_paused = False
     loop_sec = int(os.getenv("ATM_LOOP_SECONDS", "60"))
 
     while True:
         try:
             now_tw   = datetime.now(TW_TZ)
+            if not is_trade_day(now_tw):
+                if not weekend_paused:
+                    LOGGER.info("[ATM] weekend pause active, resetting intraday state")
+                    ctx.reset()
+                    history.clear()
+                    seen_ts.clear()
+                    prev_state = ATMState.IDLE
+                    weekend_paused = True
+                time.sleep(loop_sec)
+                continue
+            if weekend_paused:
+                LOGGER.info("[ATM] weekday session resumed")
+                weekend_paused = False
             windows  = kill_zone_windows(now_tw)
             t        = now_tw.time()
 
@@ -1426,7 +1440,7 @@ def _atm_thread(cfg: Config) -> None:
 
 
 def _atm_monitor_thread(cfg: Config) -> None:
-    from atm_asia_core import SYMBOL as ATM_SYMBOL, TW_TZ
+    from atm_asia_core import SYMBOL as ATM_SYMBOL, TW_TZ, is_trade_day
 
     conn = sqlite3.connect(cfg.db_path, timeout=30)
     init_db(conn)
@@ -1450,6 +1464,11 @@ def _atm_monitor_thread(cfg: Config) -> None:
                 send_telegram(cfg, summary_msg)
                 log_event(conn, "INFO", f"[ATM] nightly summary sent date={today_tw}")
                 db_set(conn, summary_key, today_tw)
+
+            if not is_trade_day(now_tw):
+                last_error_message = ""
+                time.sleep(cfg.atm_monitor_seconds)
+                continue
 
             active_rows = get_active_atm_signals(conn)
             if not active_rows:

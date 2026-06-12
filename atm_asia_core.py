@@ -45,6 +45,10 @@ def kill_zone_windows(dt: datetime) -> dict:
     return _WINTER_WINDOWS if _is_us_winter(dt) else _SUMMER_WINDOWS
 
 
+def is_trade_day(dt: datetime) -> bool:
+    return dt.astimezone(TW_TZ).weekday() <= 4
+
+
 # ─────────────────────────────────────────────────────────────────
 # Data model
 # ─────────────────────────────────────────────────────────────────
@@ -247,6 +251,10 @@ def interaction_side(candle: Candle, asia_high: float, asia_low: float) -> Optio
     return None
 
 
+def is_inside_asia_range(candle: Candle, asia_high: float, asia_low: float) -> bool:
+    return candle.high <= asia_high and candle.low >= asia_low
+
+
 def find_ob(candles: List[Candle], bias: Bias, lookback: int = 10) -> Optional[OrderBlock]:
     """
     Finds the last opposite-color candle before the displacement.
@@ -345,6 +353,8 @@ def process_candle(
     `history` should be the list of all candles seen so far (for OB lookback).
     """
     now_tw  = candle.ts.astimezone(TW_TZ)
+    if not is_trade_day(now_tw):
+        return None
     windows = kill_zone_windows(now_tw)
     t       = now_tw.time()
 
@@ -433,13 +443,16 @@ def process_candle(
 
     # ── Phase 5: signal fired — watch for re-breakout ────────────
     if ctx.state == ATMState.SIGNAL_FIRED:
-        side = interaction_side(candle, ctx.asia_high, ctx.asia_low)
-        if side is None:
+        if is_inside_asia_range(candle, ctx.asia_high, ctx.asia_low):
             ctx.interaction_rearmed = True
             return None
 
+        side = interaction_side(candle, ctx.asia_high, ctx.asia_low)
+        if side not in {"above", "below"}:
+            return None
+
         re_result = detect_interaction(candle, ctx.asia_high, ctx.asia_low)
-        if re_result and (ctx.interaction_rearmed or side != ctx.last_interaction_side):
+        if re_result and ctx.interaction_rearmed:
             new_interaction, new_bias = re_result
             log.info(
                 f"[ATM] New Asia interaction after signal → {new_interaction.value} {new_bias.value}"
