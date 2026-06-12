@@ -351,14 +351,18 @@ def process_candle(
             elif ctx.bias == Bias.SHORT and candle.close < ctx.ob.low:
                 ctx.displaced = True
                 log.info(f"[ATM] Displacement confirmed (close={candle.close:.2f} < OB.low={ctx.ob.low:.2f})")
-            return None
+            if not ctx.displaced:
+                return None
+            # just confirmed displacement — fall through to check OB zone on same candle
 
         # Step B: price returns to OB zone after displacement
         if is_in_ob_zone(candle, ctx.ob):
             ctx.state = ATMState.WAITING_WICK
             ctx.checklist["retest"] = True
             log.info(f"[ATM] Price retested OB zone @ {candle.close:.2f}")
-        return None
+            # fall through — check wick rejection on same candle
+        else:
+            return None
 
     # ── Phase 4: wick rejection → fire signal ───────────────────
     if ctx.state == ATMState.WAITING_WICK:
@@ -375,6 +379,24 @@ def process_candle(
             ctx.signal_sent = True
             log.info(f"[ATM] SIGNAL {ctx.bias.value}  entry={ctx.entry:.2f}  SL={ctx.sl:.2f}  TP1={ctx.tp1:.2f}  TP2={ctx.tp2:.2f}")
             return signal
+
+    # ── Phase 5: signal fired — watch for re-breakout ────────────
+    if ctx.state == ATMState.SIGNAL_FIRED:
+        re_result = detect_interaction(candle, ctx.asia_high, ctx.asia_low)
+        if re_result:
+            new_interaction, new_bias = re_result
+            log.info(
+                f"[ATM] Re-breakout → {new_interaction.value} {new_bias.value} "
+                f"— keeping OB H={ctx.ob.high:.2f} L={ctx.ob.low:.2f}"
+            )
+            ctx.interaction = new_interaction
+            ctx.bias        = new_bias
+            ctx.displaced   = False
+            ctx.signal_sent = False
+            ctx.state       = ATMState.WAITING_RETEST
+            ctx.checklist["retest"]         = False
+            ctx.checklist["wick_rejection"] = False
+            # ctx.ob intentionally preserved (keep old OB on re-breakout)
 
     return None
 
