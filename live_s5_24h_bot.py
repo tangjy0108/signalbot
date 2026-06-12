@@ -250,7 +250,7 @@ class Config:
     tg_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
     # ATM monitor
-    atm_monitor_seconds: float = float(os.getenv("ATM_MONITOR_SECONDS", "1"))
+    atm_monitor_seconds: float = float(os.getenv("ATM_MONITOR_SECONDS", "10"))
     atm_monitor_interval: str = os.getenv("ATM_MONITOR_INTERVAL", "1m")
     atm_daily_summary_hour: int = int(os.getenv("ATM_DAILY_SUMMARY_HOUR", "23"))
     atm_daily_summary_minute: int = int(os.getenv("ATM_DAILY_SUMMARY_MINUTE", "0"))
@@ -1401,7 +1401,8 @@ def _atm_thread(cfg: Config) -> None:
                         ATMState.ASIA_RANGE_FORMING,
                     }:
                         send_telegram(cfg, build_range_locked_msg(ctx))
-                    elif ctx.state == ATMState.WAITING_RETEST:
+                    elif ctx.state == ATMState.WAITING_RETEST and prev_state != ATMState.SIGNAL_FIRED:
+                        # Don't re-notify on re-breakout (SIGNAL_FIRED → WAITING_RETEST is silent)
                         send_telegram(cfg, build_ob_found_msg(ctx))
                     prev_state = ctx.state
 
