@@ -1346,6 +1346,7 @@ def _atm_thread(cfg: Config) -> None:
     prev_state = ATMState.IDLE
     last_signal_key = ""
     weekend_paused = False
+    first_run = True   # suppress notifications on startup to avoid replaying old state
     loop_sec = int(os.getenv("ATM_LOOP_SECONDS", "60"))
 
     while True:
@@ -1383,6 +1384,7 @@ def _atm_thread(cfg: Config) -> None:
                 history.clear()
                 seen_ts.clear()
                 prev_state = ATMState.IDLE
+                first_run = True
 
             # 14:00 TW session timeout — give up if no signal has fired yet
             if (
@@ -1395,6 +1397,7 @@ def _atm_thread(cfg: Config) -> None:
                 history.clear()
                 seen_ts.clear()
                 prev_state = ATMState.IDLE
+                first_run = True
 
             candles = atm_fetch(ATM_SYMBOL, interval, limit=120)
             for c in candles[:-1]:
@@ -1405,20 +1408,20 @@ def _atm_thread(cfg: Config) -> None:
 
                 signal = process_candle(c, ctx, history)
 
-                # state-change notifications
+                # state-change notifications (suppressed on first run to avoid replaying history)
                 if ctx.state != prev_state:
                     LOGGER.info("[ATM] state %s → %s", prev_state, ctx.state)
-                    if ctx.state == ATMState.ASIA_RANGE_LOCKED and prev_state in {
-                        ATMState.IDLE,
-                        ATMState.ASIA_RANGE_FORMING,
-                    }:
-                        send_telegram(cfg, build_range_locked_msg(ctx))
-                    elif ctx.state == ATMState.WAITING_RETEST and prev_state != ATMState.SIGNAL_FIRED:
-                        # Don't re-notify on re-breakout (SIGNAL_FIRED → WAITING_RETEST is silent)
-                        send_telegram(cfg, build_ob_found_msg(ctx))
+                    if not first_run:
+                        if ctx.state == ATMState.ASIA_RANGE_LOCKED and prev_state in {
+                            ATMState.IDLE,
+                            ATMState.ASIA_RANGE_FORMING,
+                        }:
+                            send_telegram(cfg, build_range_locked_msg(ctx))
+                        elif ctx.state == ATMState.WAITING_RETEST and prev_state != ATMState.SIGNAL_FIRED:
+                            send_telegram(cfg, build_ob_found_msg(ctx))
                     prev_state = ctx.state
 
-                if signal:
+                if signal and not first_run:
                     signal_key = str(signal.get("signal_key") or signal.get("signal_time") or "")
                     if signal_key and signal_key == last_signal_key:
                         LOGGER.info("[ATM] duplicate signal skipped key=%s", signal_key)
@@ -1444,6 +1447,8 @@ def _atm_thread(cfg: Config) -> None:
                     )
                     send_telegram(cfg, signal["telegram_message"])
                     last_signal_key = signal_key
+
+            first_run = False  # after first batch, enable notifications
 
         except Exception as exc:
             LOGGER.exception("[ATM] loop error: %s", exc)
