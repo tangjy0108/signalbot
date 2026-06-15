@@ -1418,7 +1418,7 @@ def _atm_thread(cfg: Config) -> None:
                         }:
                             send_telegram(cfg, build_range_locked_msg(ctx))
                         elif ctx.state == ATMState.WAITING_RETEST and prev_state != ATMState.SIGNAL_FIRED:
-                            send_telegram(cfg, build_ob_found_msg(ctx))
+                            send_telegram(cfg, build_ob_found_msg(ctx) + f"\n_[debug] from: {prev_state}_")
                     prev_state = ctx.state
 
                 if signal and not first_run:
