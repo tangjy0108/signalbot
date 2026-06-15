@@ -1450,6 +1450,9 @@ def _atm_thread(cfg: Config) -> None:
                     send_telegram(cfg, signal["telegram_message"])
                     last_signal_key = signal_key
 
+            # After first batch: catch-up notification if bot started mid-session
+            if first_run and ctx.state in {ATMState.WAITING_RETEST, ATMState.WAITING_WICK}:
+                send_telegram(cfg, build_ob_found_msg(ctx) + "\n_[startup catch-up]_")
             first_run = False  # after first batch, enable notifications
 
         except Exception as exc:
