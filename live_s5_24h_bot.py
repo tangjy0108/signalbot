@@ -1326,7 +1326,7 @@ def _atm_thread(cfg: Config) -> None:
         from atm_asia_core import (
             ATMContext, ATMState, fetch_klines as atm_fetch,
             process_candle, should_daily_reset,
-            build_range_locked_msg, build_ob_found_msg,
+            build_range_locked_msg, build_ob_found_msg, build_tokyo_range_locked_msg,
             kill_zone_windows, is_trade_day, SYMBOL as ATM_SYMBOL, TW_TZ,
         )
     except ImportError as exc:
@@ -1344,6 +1344,7 @@ def _atm_thread(cfg: Config) -> None:
     history  = []
     seen_ts  = set()
     prev_state = ATMState.IDLE
+    prev_tokyo_locked = False
     last_signal_key = ""
     weekend_paused = False
     first_run = True   # suppress notifications on startup to avoid replaying old state
@@ -1359,6 +1360,7 @@ def _atm_thread(cfg: Config) -> None:
                     history.clear()
                     seen_ts.clear()
                     prev_state = ATMState.IDLE
+                    prev_tokyo_locked = False
                     weekend_paused = True
                 time.sleep(loop_sec)
                 continue
@@ -1376,6 +1378,7 @@ def _atm_thread(cfg: Config) -> None:
                 history.clear()
                 seen_ts.clear()
                 prev_state = ATMState.IDLE
+                prev_tokyo_locked = False
                 first_run = True
 
             # 14:00 TW session timeout — give up if no signal has fired yet
@@ -1389,6 +1392,7 @@ def _atm_thread(cfg: Config) -> None:
                 history.clear()
                 seen_ts.clear()
                 prev_state = ATMState.IDLE
+                prev_tokyo_locked = False
                 first_run = True
 
             candles = atm_fetch(ATM_SYMBOL, interval, limit=120)
@@ -1399,6 +1403,12 @@ def _atm_thread(cfg: Config) -> None:
                 history.append(c)
 
                 signal = process_candle(c, ctx, history)
+
+                # Tokyo range lock notification (state doesn't change, track separately)
+                if ctx.tokyo_range_locked and not prev_tokyo_locked:
+                    prev_tokyo_locked = True
+                    if not first_run:
+                        send_telegram(cfg, build_tokyo_range_locked_msg(ctx))
 
                 # state-change notifications (suppressed on first run to avoid replaying history)
                 if ctx.state != prev_state:

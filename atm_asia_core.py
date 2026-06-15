@@ -112,13 +112,18 @@ class ATMContext:
     asia_high:        float = 0.0
     asia_low:         float = float("inf")
     asia_range_locked: bool = False
+    tokyo_high:       float = 0.0
+    tokyo_low:        float = float("inf")
+    tokyo_range_locked: bool = False
+    ref_high:         float = 0.0    # active range high when setup was triggered
+    ref_low:          float = 0.0    # active range low when setup was triggered
     interaction:      Optional[InteractionType] = None
     bias:             Optional[Bias] = None
     ob:               Optional[OrderBlock] = None
     displaced:        bool = False             # True once price moves away from OB after interaction
     entry:            Optional[float] = None
     sl:               Optional[float] = None
-    tp1:              Optional[float] = None   # Asia High/Low target
+    tp1:              Optional[float] = None   # Range High/Low target
     tp2:              Optional[float] = None   # 1:2 R:R target
     signal_sent:      bool = False
     last_interaction_side: Optional[str] = None
@@ -307,6 +312,8 @@ def _reset_setup_progress(ctx: ATMContext) -> None:
     ctx.sl = None
     ctx.tp1 = None
     ctx.tp2 = None
+    ctx.ref_high = 0.0
+    ctx.ref_low = 0.0
     ctx.signal_sent = False
     ctx.checklist["interaction"] = False
     ctx.checklist["ob_found"] = False
@@ -323,12 +330,15 @@ def _start_interaction_setup(
     side: str,
 ) -> None:
     _reset_setup_progress(ctx)
+    # Capture active reference range at setup time (Tokyo if locked, else Asia)
+    ctx.ref_high = ctx.tokyo_high if ctx.tokyo_range_locked else ctx.asia_high
+    ctx.ref_low  = ctx.tokyo_low  if ctx.tokyo_range_locked else ctx.asia_low
     ctx.interaction = interaction
     ctx.bias = bias
     ctx.last_interaction_side = side
     ctx.interaction_rearmed = False
     ctx.checklist["interaction"] = True
-    log.info(f"[ATM] {ctx.interaction.value} → {ctx.bias.value}")
+    log.info(f"[ATM] {ctx.interaction.value} → {ctx.bias.value} (ref H={ctx.ref_high:.2f} L={ctx.ref_low:.2f})")
     ob = find_ob(history, ctx.bias)
     if ob:
         ctx.ob = ob
@@ -358,10 +368,12 @@ def process_candle(
     windows = kill_zone_windows(now_tw)
     t       = now_tw.time()
 
-    in_asia_kz = windows["asia_start"] <= t < windows["asia_end"]
-    post_asia  = t >= windows["asia_end"]
+    in_asia_kz  = windows["asia_start"]  <= t < windows["asia_end"]
+    in_tokyo_kz = windows["tokyo_start"] <= t < windows["tokyo_end"]
+    post_asia   = t >= windows["asia_end"]
+    post_tokyo  = t >= windows["tokyo_end"]
 
-    # ── Phase 1: collect range ───────────────────────────────────
+    # ── Phase 1: collect Asia range ──────────────────────────────
     if in_asia_kz:
         ctx.state     = ATMState.ASIA_RANGE_FORMING
         ctx.asia_high = max(ctx.asia_high, candle.high)
@@ -369,7 +381,7 @@ def process_candle(
         ctx.checklist["time_filter"] = True
         return None
 
-    # ── Lock range at Kill Zone close ────────────────────────────
+    # ── Lock Asia range at Kill Zone close ───────────────────────
     if not ctx.asia_range_locked and post_asia and ctx.asia_high > 0:
         ctx.asia_range_locked = True
         ctx.state             = ATMState.ASIA_RANGE_LOCKED
@@ -379,11 +391,27 @@ def process_candle(
     if not ctx.asia_range_locked:
         return None
 
+    # ── Phase 1.5: collect Tokyo range (only if no active setup yet) ─
+    if in_tokyo_kz and not ctx.tokyo_range_locked:
+        ctx.tokyo_high = max(ctx.tokyo_high, candle.high)
+        ctx.tokyo_low  = min(ctx.tokyo_low,  candle.low)
+        if ctx.state == ATMState.ASIA_RANGE_LOCKED:
+            return None   # wait for Tokyo KZ to close before detecting interaction
+
+    # ── Lock Tokyo range after Tokyo KZ closes ───────────────────
+    if post_tokyo and not ctx.tokyo_range_locked and ctx.tokyo_high > 0:
+        ctx.tokyo_range_locked = True
+        log.info(f"[ATM] Tokyo Range locked  H={ctx.tokyo_high:.2f}  L={ctx.tokyo_low:.2f}")
+
+    # ── Determine active reference range ─────────────────────────
+    ref_high = ctx.tokyo_high if ctx.tokyo_range_locked else ctx.asia_high
+    ref_low  = ctx.tokyo_low  if ctx.tokyo_range_locked else ctx.asia_low
+
     # ── Phase 2: watch for interaction ───────────────────────────
     if ctx.state == ATMState.ASIA_RANGE_LOCKED:
-        result = detect_interaction(candle, ctx.asia_high, ctx.asia_low)
+        result = detect_interaction(candle, ref_high, ref_low)
         if result:
-            side = interaction_side(candle, ctx.asia_high, ctx.asia_low)
+            side = interaction_side(candle, ref_high, ref_low)
             if side:
                 interaction, bias = result
                 _start_interaction_setup(candle, ctx, history, interaction, bias, side)
@@ -443,19 +471,19 @@ def process_candle(
 
     # ── Phase 5: signal fired — watch for re-breakout ────────────
     if ctx.state == ATMState.SIGNAL_FIRED:
-        if is_inside_asia_range(candle, ctx.asia_high, ctx.asia_low):
+        if is_inside_asia_range(candle, ref_high, ref_low):
             ctx.interaction_rearmed = True
             return None
 
-        side = interaction_side(candle, ctx.asia_high, ctx.asia_low)
+        side = interaction_side(candle, ref_high, ref_low)
         if side not in {"above", "below"}:
             return None
 
-        re_result = detect_interaction(candle, ctx.asia_high, ctx.asia_low)
+        re_result = detect_interaction(candle, ref_high, ref_low)
         if re_result and ctx.interaction_rearmed:
             new_interaction, new_bias = re_result
             log.info(
-                f"[ATM] New Asia interaction after signal → {new_interaction.value} {new_bias.value}"
+                f"[ATM] New interaction after signal → {new_interaction.value} {new_bias.value}"
             )
             _start_interaction_setup(candle, ctx, history, new_interaction, new_bias, side)
 
@@ -475,23 +503,27 @@ def _calculate_levels(ctx: ATMContext, candle: Candle):
     if ctx.bias == Bias.LONG:
         ctx.entry = candle.close
         ctx.sl    = ob.low - tick                              # just below OB low (wick)
-        ctx.tp1   = ctx.asia_high                             # Asia High = liquidity target
+        ctx.tp1   = ctx.ref_high                              # Range High = liquidity target
         ctx.tp2   = ctx.entry + 2.0 * (ctx.entry - ctx.sl)   # 1:2 R:R fallback
     else:
         ctx.entry = candle.close
         ctx.sl    = ob.high + tick                             # just above OB high (wick)
-        ctx.tp1   = ctx.asia_low                              # Asia Low = liquidity target
+        ctx.tp1   = ctx.ref_low                               # Range Low = liquidity target
         ctx.tp2   = ctx.entry - 2.0 * (ctx.sl - ctx.entry)   # 1:2 R:R fallback
 
 
 def _build_signal(ctx: ATMContext, candle: Candle) -> dict:
-    cl        = ctx.checklist
-    direction = "📈 LONG" if ctx.bias == Bias.LONG else "📉 SHORT"
-    risk      = abs(ctx.entry - ctx.sl)
-    rr1       = abs(ctx.tp1 - ctx.entry) / risk if risk else 0
-    rr2       = abs(ctx.tp2 - ctx.entry) / risk if risk else 0
-    sl_label  = f"OB 低點 {ctx.ob.low:.2f}" if ctx.bias == Bias.LONG else f"OB 高點 {ctx.ob.high:.2f}"
-    tp1_label = f"Asia High {ctx.asia_high:.0f}" if ctx.bias == Bias.LONG else f"Asia Low {ctx.asia_low:.0f}"
+    cl         = ctx.checklist
+    direction  = "📈 LONG" if ctx.bias == Bias.LONG else "📉 SHORT"
+    risk       = abs(ctx.entry - ctx.sl)
+    rr1        = abs(ctx.tp1 - ctx.entry) / risk if risk else 0
+    rr2        = abs(ctx.tp2 - ctx.entry) / risk if risk else 0
+    sl_label   = f"OB 低點 {ctx.ob.low:.2f}" if ctx.bias == Bias.LONG else f"OB 高點 {ctx.ob.high:.2f}"
+    range_name = "Tokyo" if ctx.tokyo_range_locked else "Asia"
+    tp1_label  = (
+        f"{range_name} High {ctx.ref_high:.0f}" if ctx.bias == Bias.LONG
+        else f"{range_name} Low {ctx.ref_low:.0f}"
+    )
 
     checklist_lines = "\n".join([
         f"{'✅' if cl['time_filter']    else '⬜'} Kill Zone 時段確認",
@@ -502,8 +534,9 @@ def _build_signal(ctx: ATMContext, candle: Candle) -> dict:
         f"{'✅' if cl['wick_rejection'] else '⬜'} Wick Rejection 確認",
     ])
 
+    session_name = "東京盤" if ctx.tokyo_range_locked else "亞洲盤"
     msg = (
-        f"⚡ *ATM 亞洲盤訊號* — {direction}\n"
+        f"⚡ *ATM {session_name}訊號* — {direction}\n"
         f"━━━━━━━━━━━━━━━━\n"
         f"{checklist_lines}\n"
         f"━━━━━━━━━━━━━━━━\n"
@@ -562,11 +595,14 @@ def build_range_locked_msg(ctx: ATMContext) -> str:
 
 def build_ob_found_msg(ctx: ATMContext) -> str:
     """Sent once when interaction + OB are identified."""
-    direction = "📈 LONG" if ctx.bias == Bias.LONG else "📉 SHORT"
+    direction  = "📈 LONG" if ctx.bias == Bias.LONG else "📉 SHORT"
+    range_name = "Tokyo" if ctx.tokyo_range_locked else "Asia"
+    ref_h = ctx.ref_high if ctx.ref_high > 0 else ctx.asia_high
+    ref_l = ctx.ref_low  if ctx.ref_low  > 0 else ctx.asia_low
     cl = ctx.checklist
     lines = "\n".join([
         f"{'✅' if cl['time_filter']  else '⬜'} Kill Zone 時段確認",
-        f"{'✅' if cl['asia_range']   else '⬜'} Asia Range  H:{ctx.asia_high:.0f} / L:{ctx.asia_low:.0f}",
+        f"{'✅' if cl['asia_range']   else '⬜'} {range_name} Range  H:{ref_h:.0f} / L:{ref_l:.0f}",
         f"{'✅' if cl['interaction']  else '⬜'} {ctx.interaction.value} → {ctx.bias.value}",
         f"{'✅' if cl['ob_found']     else '⬜'} OB 確認  {ctx.ob.low:.0f} – {ctx.ob.high:.0f}",
         f"⬜ 等待回踩 OB...",
@@ -574,6 +610,25 @@ def build_ob_found_msg(ctx: ATMContext) -> str:
     ])
     return (
         f"🔍 *ATM — OB 確認* {direction}\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"{lines}"
+    )
+
+
+def build_tokyo_range_locked_msg(ctx: ATMContext) -> str:
+    """Sent once when Tokyo Range is locked."""
+    cl = ctx.checklist
+    lines = "\n".join([
+        f"{'✅' if cl['time_filter'] else '⬜'} Kill Zone 時段確認",
+        f"✅ Asia Range  H:{ctx.asia_high:.0f} / L:{ctx.asia_low:.0f}",
+        f"✅ Tokyo Range 鎖定  H:{ctx.tokyo_high:.0f} / L:{ctx.tokyo_low:.0f}",
+        f"⬜ 等待互動 (Sweep / Breakout)...",
+        f"⬜ OB",
+        f"⬜ 回踩",
+        f"⬜ Wick Rejection",
+    ])
+    return (
+        f"🗼 *ATM — Tokyo Range 鎖定*\n"
         f"━━━━━━━━━━━━━━━━\n"
         f"{lines}"
     )
