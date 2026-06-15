@@ -1368,15 +1368,7 @@ def _atm_thread(cfg: Config) -> None:
             windows  = kill_zone_windows(now_tw)
             t        = now_tw.time()
 
-            in_asia  = windows["asia_start"] <= t < windows["asia_end"]
-            in_tokyo = windows["tokyo_start"] <= t < windows["tokyo_end"]
-            # Tokyo KZ must be checked before post_az — both are True during 09:00-10:00
-            if in_asia:
-                interval = "1m"
-            elif in_tokyo:
-                interval = "5m"
-            else:
-                interval = "1m"
+            interval = "1m"
 
             if should_daily_reset(ctx, now_tw):
                 LOGGER.info("[ATM] daily reset")
