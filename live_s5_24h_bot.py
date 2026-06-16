@@ -1331,7 +1331,8 @@ def _atm_thread(cfg: Config) -> None:
         from atm_asia_core import (
             ATMContext, ATMState, fetch_klines as atm_fetch,
             process_candle, should_daily_reset,
-            build_range_locked_msg, build_ob_found_msg, build_tokyo_range_locked_msg,
+            build_range_locked_msg, build_ob_found_msg,
+            build_tokyo_range_locked_msg, build_ob_invalidated_msg,
             kill_zone_windows, is_trade_day, SYMBOL as ATM_SYMBOL, TW_TZ,
         )
     except ImportError as exc:
@@ -1443,6 +1444,12 @@ def _atm_thread(cfg: Config) -> None:
                     prev_state = ctx.state
 
                 if signal and not first_run:
+                    # ── OB invalidation notification (no DB write) ──
+                    if signal.get("notification_type") == "OB_INVALIDATED":
+                        send_telegram(cfg, signal["telegram_message"])
+                        continue
+
+                    # ── trade signal ────────────────────────────────
                     signal_key = str(signal.get("signal_key") or signal.get("signal_time") or "")
                     if signal_key and signal_key == last_signal_key:
                         LOGGER.info("[ATM] duplicate signal skipped key=%s", signal_key)

@@ -426,16 +426,18 @@ def process_candle(
     if ctx.state == ATMState.WAITING_RETEST:
         if ob_invalidated(candle, ctx.ob):
             log.warning("[ATM] OB invalidated — trying Reversal OB")
+            old_bias = ctx.bias
+            old_ob   = ctx.ob
             rev_bias = Bias.SHORT if ctx.bias == Bias.LONG else Bias.LONG
             rev_ob   = find_ob(history, rev_bias, lookback=5)
             if rev_ob:
-                ctx.bias     = rev_bias
-                ctx.ob       = rev_ob
+                ctx.bias      = rev_bias
+                ctx.ob        = rev_ob
                 ctx.displaced = False
                 log.info(f"[ATM] Reversal OB  H={rev_ob.high:.2f}  L={rev_ob.low:.2f}")
             else:
                 ctx.reset()
-            return None
+            return build_ob_invalidated_msg(old_bias, old_ob, candle, "等待回踩中", rev_ob)
 
         # Step A: wait for displacement away from OB before accepting a retest
         if not ctx.displaced:
@@ -462,8 +464,10 @@ def process_candle(
     if ctx.state == ATMState.WAITING_WICK:
         if ob_invalidated(candle, ctx.ob):
             log.warning("[ATM] OB invalidated during wick wait — reset")
+            old_bias = ctx.bias
+            old_ob   = ctx.ob
             ctx.reset()
-            return None
+            return build_ob_invalidated_msg(old_bias, old_ob, candle, "等待影線拒絕中")
 
         if detect_wick_rejection(candle, ctx.ob):
             ctx.checklist["wick_rejection"] = True
@@ -643,6 +647,37 @@ def build_tokyo_range_locked_msg(ctx: ATMContext) -> str:
         f"━━━━━━━━━━━━━━━━\n"
         f"{lines}"
     )
+
+
+def build_ob_invalidated_msg(
+    old_bias: "Bias",
+    old_ob:   "OrderBlock",
+    candle:   "Candle",
+    phase:    str,
+    rev_ob:   "Optional[OrderBlock]" = None,
+) -> dict:
+    """Return a notification dict when an OB is invalidated."""
+    bias_str = old_bias.value
+    time_str = candle.ts.astimezone(TW_TZ).strftime("%H:%M")
+    close    = candle.close
+
+    if rev_ob:
+        rev_bias_str = "SHORT" if old_bias == Bias.LONG else "LONG"
+        msg = (
+            f"↩️ *OB 失效 → 轉換方向*\n"
+            f"原方向: {bias_str}  OB: `{old_ob.low:.0f}–{old_ob.high:.0f}`\n"
+            f"突破收盤: `{close:.2f}`\n"
+            f"新方向: {rev_bias_str}  新OB: `{rev_ob.low:.2f}–{rev_ob.high:.2f}`\n"
+            f"_({phase})  {time_str}_"
+        )
+    else:
+        msg = (
+            f"❌ *OB 失效 → 重設*\n"
+            f"原方向: {bias_str}  OB: `{old_ob.low:.0f}–{old_ob.high:.0f}`\n"
+            f"突破收盤: `{close:.2f}`\n"
+            f"_({phase})  {time_str}_"
+        )
+    return {"notification_type": "OB_INVALIDATED", "telegram_message": msg}
 
 
 # ─────────────────────────────────────────────────────────────────
