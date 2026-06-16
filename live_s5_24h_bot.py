@@ -1472,7 +1472,12 @@ def _atm_thread(cfg: Config) -> None:
                     # ── auto-trade ──────────────────────────────────
                     if _auto_trade:
                         try:
-                            from bingx_trade import place_atm_trade, format_trade_notification
+                            from bingx_trade import (
+                                place_atm_trade,
+                                format_trade_notification,
+                                format_trade_skipped,
+                                format_trade_error,
+                            )
                             trade_results, trade_err = place_atm_trade(
                                 bias   = signal["direction"],
                                 entry  = float(signal["entry"]),
@@ -1483,13 +1488,12 @@ def _atm_thread(cfg: Config) -> None:
                                 secret = cfg.bingx_api_secret,
                             )
                             if trade_results:
-                                tg_msg = format_trade_notification(trade_results, trade_err)
-                                send_telegram(cfg, tg_msg)
+                                send_telegram(cfg, format_trade_notification(trade_results, trade_err))
                             else:
-                                send_telegram(cfg, f"⚠️ Auto-trade skipped: {trade_err}")
+                                send_telegram(cfg, format_trade_skipped(trade_err or "unknown"))
                         except Exception as _te:
                             LOGGER.exception("[ATM] Auto-trade error: %s", _te)
-                            send_telegram(cfg, f"❌ Auto-trade error: {_te}")
+                            send_telegram(cfg, format_trade_error(str(_te)))
 
             # After first batch: catch-up notification if bot started mid-session
             if first_run and ctx.state in {ATMState.WAITING_RETEST, ATMState.WAITING_WICK}:

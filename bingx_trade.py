@@ -217,18 +217,37 @@ def place_atm_trade(
 
 
 def format_trade_notification(results: dict, err: Optional[str]) -> str:
-    """Build a Telegram message summarising what was placed."""
+    """Build a Telegram message with order details for debugging."""
     bias  = results.get("bias", "?")
     emoji = "📈" if bias == "LONG" else "📉"
+
+    def oid(key: str) -> str:
+        v = results.get(key)
+        return f"<code>{v}</code>" if v else "❌ 未下單"
+
     lines = [
-        f"{emoji} <b>Auto Trade Placed — {bias}</b>",
+        f"{emoji} <b>Auto Trade — {bias}</b>",
         "",
-        f"📍 Entry  : <code>{results['entry']:.2f}</code>  (qty {results['qty_total']})",
-        f"🛡️ SL     : <code>{results['sl']:.2f}</code>  (closePosition)",
-        f"🎯 TP1 75%: <code>{results['tp1']:.2f}</code>  (qty {results['qty_tp1']})",
+        f"📍 進場 <code>{results['entry']:.2f}</code>  qty <code>{results['qty_total']}</code>",
+        f"   └ order {oid('entry_order_id')}",
+        f"🛡️ SL   <code>{results['sl']:.2f}</code>  (closePosition=true)",
+        f"   └ order {oid('sl_order_id')}",
+        f"🎯 TP1  <code>{results['tp1']:.2f}</code>  qty <code>{results['qty_tp1']}</code>  (75%)",
+        f"   └ order {oid('tp1_order_id')}",
     ]
     if results.get("qty_tp2"):
-        lines.append(f"🎯 TP2 25%: <code>{results['tp2']:.2f}</code>  (qty {results['qty_tp2']})")
+        lines += [
+            f"🎯 TP2  <code>{results['tp2']:.2f}</code>  qty <code>{results['qty_tp2']}</code>  (25%)",
+            f"   └ order {oid('tp2_order_id')}",
+        ]
     if err:
         lines += ["", f"⚠️ <i>{err}</i>"]
     return "\n".join(lines)
+
+
+def format_trade_skipped(reason: str) -> str:
+    return f"⏭️ <b>Auto Trade 跳過</b>\n<i>{reason}</i>"
+
+
+def format_trade_error(err: str) -> str:
+    return f"❌ <b>Auto Trade 失敗</b>\n<i>{err}</i>"
