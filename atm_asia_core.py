@@ -400,8 +400,13 @@ def process_candle(
 
     # ── Lock Tokyo range after Tokyo KZ closes ───────────────────
     if post_tokyo and not ctx.tokyo_range_locked and ctx.tokyo_high > 0:
-        ctx.tokyo_range_locked = True
-        log.info(f"[ATM] Tokyo Range locked  H={ctx.tokyo_high:.2f}  L={ctx.tokyo_low:.2f}")
+        tokyo_extends = ctx.tokyo_high > ctx.asia_high or ctx.tokyo_low < ctx.asia_low
+        if tokyo_extends:
+            ctx.tokyo_range_locked = True
+            log.info(f"[ATM] Tokyo Range locked  H={ctx.tokyo_high:.2f}  L={ctx.tokyo_low:.2f}")
+        else:
+            # Tokyo KZ stayed inside Asia range — keep Asia as reference
+            log.info(f"[ATM] Tokyo Range inside Asia — using Asia  TH={ctx.tokyo_high:.2f} TL={ctx.tokyo_low:.2f} AH={ctx.asia_high:.2f} AL={ctx.asia_low:.2f}")
 
     # ── Determine active reference range ─────────────────────────
     ref_high = ctx.tokyo_high if ctx.tokyo_range_locked else ctx.asia_high
