@@ -249,6 +249,11 @@ class Config:
     tg_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     tg_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
+    # BingX auto-trade (ATM signals)
+    atm_auto_trade: bool = os.getenv("ATM_AUTO_TRADE", "false").lower() == "true"
+    bingx_api_key: str = os.getenv("BINGX_API_KEY", "")
+    bingx_api_secret: str = os.getenv("BINGX_API_SECRET", "")
+
     # ATM monitor
     atm_monitor_seconds: float = float(os.getenv("ATM_MONITOR_SECONDS", "10"))
     atm_monitor_interval: str = os.getenv("ATM_MONITOR_INTERVAL", "1m")
@@ -1338,6 +1343,20 @@ def _atm_thread(cfg: Config) -> None:
         ATM_VERSION, ATM_SYMBOL, os.getenv("ATM_USE_MOCK", "0"),
     )
 
+    # ── auto-trade setup ────────────────────────────────────────────
+    _auto_trade = cfg.atm_auto_trade and cfg.bingx_api_key and cfg.bingx_api_secret
+    if _auto_trade:
+        try:
+            from bingx_trade import set_leverage
+            set_leverage(cfg.bingx_api_key, cfg.bingx_api_secret)
+            LOGGER.info("[ATM] Auto-trade ON — leverage set")
+            send_telegram(cfg, "🤖 ATM Auto-Trade 啟動 (100x, 20 USDT/單)")
+        except Exception as _e:
+            LOGGER.error("[ATM] Auto-trade init failed: %s", _e)
+            _auto_trade = False
+    else:
+        LOGGER.info("[ATM] Auto-trade OFF")
+
     conn = sqlite3.connect(cfg.db_path, timeout=30)
     init_db(conn)
     ctx      = ATMContext()
@@ -1449,6 +1468,28 @@ def _atm_thread(cfg: Config) -> None:
                     )
                     send_telegram(cfg, signal["telegram_message"])
                     last_signal_key = signal_key
+
+                    # ── auto-trade ──────────────────────────────────
+                    if _auto_trade:
+                        try:
+                            from bingx_trade import place_atm_trade, format_trade_notification
+                            trade_results, trade_err = place_atm_trade(
+                                bias   = signal["direction"],
+                                entry  = float(signal["entry"]),
+                                sl     = float(signal["sl"]),
+                                tp1    = float(signal["tp1"]),
+                                tp2    = float(signal["tp2"]),
+                                api_key= cfg.bingx_api_key,
+                                secret = cfg.bingx_api_secret,
+                            )
+                            if trade_results:
+                                tg_msg = format_trade_notification(trade_results, trade_err)
+                                send_telegram(cfg, tg_msg)
+                            else:
+                                send_telegram(cfg, f"⚠️ Auto-trade skipped: {trade_err}")
+                        except Exception as _te:
+                            LOGGER.exception("[ATM] Auto-trade error: %s", _te)
+                            send_telegram(cfg, f"❌ Auto-trade error: {_te}")
 
             # After first batch: catch-up notification if bot started mid-session
             if first_run and ctx.state in {ATMState.WAITING_RETEST, ATMState.WAITING_WICK}:
