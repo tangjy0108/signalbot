@@ -29,10 +29,12 @@ USE_MOCK   = os.getenv("ATM_USE_MOCK", "0") == "1"   # set "1" to use mock data 
 _SUMMER_WINDOWS = {
     "asia_start": time(6, 0), "asia_end": time(7, 0),
     "tokyo_start": time(9, 0), "tokyo_end": time(10, 0),
+    "us_start": time(21, 30),
 }
 _WINTER_WINDOWS = {
     "asia_start": time(7, 0), "asia_end": time(8, 0),
     "tokyo_start": time(10, 0), "tokyo_end": time(11, 0),
+    "us_start": time(22, 30),
 }
 
 
@@ -128,6 +130,7 @@ class ATMContext:
     signal_sent:      bool = False
     last_interaction_side: Optional[str] = None
     interaction_rearmed: bool = False
+    us_expired:       bool = False   # True after US session opens; cleared by daily reset
     checklist: dict = field(default_factory=lambda: {
         "time_filter":   False,
         "asia_range":    False,
@@ -368,6 +371,19 @@ def process_candle(
     windows = kill_zone_windows(now_tw)
     t       = now_tw.time()
 
+    # ── US session expiry: stop monitoring at NY open ────────────
+    if ctx.us_expired:
+        return None
+    if t >= windows["us_start"]:
+        notification = None
+        if ctx.state in (ATMState.WAITING_RETEST, ATMState.WAITING_WICK):
+            notification = _build_us_expired_msg(ctx, candle)
+        _reset_setup_progress(ctx)
+        ctx.state      = ATMState.IDLE
+        ctx.us_expired = True
+        log.info("[ATM] US session opened — monitoring ended for today")
+        return notification
+
     in_asia_kz  = windows["asia_start"]  <= t < windows["asia_end"]
     in_tokyo_kz = windows["tokyo_start"] <= t < windows["tokyo_end"]
     post_asia   = t >= windows["asia_end"]
@@ -436,7 +452,9 @@ def process_candle(
                 ctx.displaced = False
                 log.info(f"[ATM] Reversal OB  H={rev_ob.high:.2f}  L={rev_ob.low:.2f}")
             else:
-                ctx.reset()
+                _reset_setup_progress(ctx)
+                ctx.state = ATMState.ASIA_RANGE_LOCKED  # keep watching like soup does
+                log.info("[ATM] No reversal OB — back to ASIA_RANGE_LOCKED")
             return build_ob_invalidated_msg(old_bias, old_ob, candle, "等待回踩中", rev_ob)
 
         # Step A: wait for displacement away from OB before accepting a retest
@@ -463,10 +481,11 @@ def process_candle(
     # ── Phase 4: wick rejection → fire signal ───────────────────
     if ctx.state == ATMState.WAITING_WICK:
         if ob_invalidated(candle, ctx.ob):
-            log.warning("[ATM] OB invalidated during wick wait — reset")
+            log.warning("[ATM] OB invalidated during wick wait — back to ASIA_RANGE_LOCKED")
             old_bias = ctx.bias
             old_ob   = ctx.ob
-            ctx.reset()
+            _reset_setup_progress(ctx)
+            ctx.state = ATMState.ASIA_RANGE_LOCKED  # keep watching like soup does
             return build_ob_invalidated_msg(old_bias, old_ob, candle, "等待影線拒絕中")
 
         if detect_wick_rejection(candle, ctx.ob):
@@ -647,6 +666,18 @@ def build_tokyo_range_locked_msg(ctx: ATMContext) -> str:
         f"━━━━━━━━━━━━━━━━\n"
         f"{lines}"
     )
+
+
+def _build_us_expired_msg(ctx: "ATMContext", candle: "Candle") -> dict:
+    time_str = candle.ts.astimezone(TW_TZ).strftime("%H:%M")
+    phase = "等待回踩中" if ctx.state == ATMState.WAITING_RETEST else "等待影線拒絕中"
+    ob = ctx.ob
+    msg = (
+        f"⏰ *ATM 監控結束 — 美盤開始*\n"
+        f"方向: {ctx.bias.value}  OB: `{ob.low:.0f}–{ob.high:.0f}`\n"
+        f"_(在 {phase} 時到期)  {time_str}_"
+    )
+    return {"notification_type": "OB_INVALIDATED", "telegram_message": msg}
 
 
 def build_ob_invalidated_msg(
