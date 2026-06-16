@@ -502,14 +502,20 @@ def _calculate_levels(ctx: ATMContext, candle: Candle):
 
     if ctx.bias == Bias.LONG:
         ctx.entry = candle.close
-        ctx.sl    = ob.low - tick                              # just below OB low (wick)
-        ctx.tp1   = ctx.ref_high                              # Range High = liquidity target
-        ctx.tp2   = ctx.entry + 2.0 * (ctx.entry - ctx.sl)   # 1:2 R:R fallback
+        ctx.sl    = ob.low - tick
+        ctx.tp1   = ctx.ref_high
+        risk      = ctx.entry - ctx.sl
+        tp2_rr    = ctx.entry + 2.0 * risk
+        # TP2 must always be further than TP1; fall back to TP1 + 1R when 1:2 R:R falls short
+        ctx.tp2   = tp2_rr if tp2_rr > ctx.tp1 else ctx.tp1 + risk
     else:
         ctx.entry = candle.close
-        ctx.sl    = ob.high + tick                             # just above OB high (wick)
-        ctx.tp1   = ctx.ref_low                               # Range Low = liquidity target
-        ctx.tp2   = ctx.entry - 2.0 * (ctx.sl - ctx.entry)   # 1:2 R:R fallback
+        ctx.sl    = ob.high + tick
+        ctx.tp1   = ctx.ref_low
+        risk      = ctx.sl - ctx.entry
+        tp2_rr    = ctx.entry - 2.0 * risk
+        # TP2 must always be further than TP1; fall back to TP1 - 1R when 1:2 R:R falls short
+        ctx.tp2   = tp2_rr if tp2_rr < ctx.tp1 else ctx.tp1 - risk
 
 
 def _build_signal(ctx: ATMContext, candle: Candle) -> dict:
