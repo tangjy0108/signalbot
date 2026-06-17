@@ -9,6 +9,8 @@ Variants:
   OPT3  OB minimum body size >= 10 pts
   OPT4  OB must have a Fair Value Gap in the 8 candles after it
   OPT5  after SIGNAL_FIRED, no re-interaction same session
+  OPT6  SWEEP TP1 = entry + 2R (fixed), TP2 = ref_high (original big target)
+  OPT7  SWEEP TP1 = entry + 3R (fixed), TP2 = ref_high (original big target)
 
 Usage:
   python atm_backtest.py              # last 60 days
@@ -70,6 +72,7 @@ class Opts:
     require_fvg:       bool  = False
     no_reinteract:     bool  = False
     breakout_only:     bool  = False  # skip all SWEEP interactions
+    sweep_tp1_r:       float = 0.0    # OPT6/7: fixed-R TP1 for SWEEP (0=use ref_high)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BingX data fetch with pagination
@@ -198,20 +201,29 @@ def wick_reject(c: Candle, ob: dict, bias: str) -> bool:
     return c.high >= ob["mid"] and c.close < ob["high"] and uw > c.body_size * 0.5
 
 def make_signal(c: Candle, bias: str, interaction: str,
-                ob: dict, ref_high: float, ref_low: float) -> Signal:
+                ob: dict, ref_high: float, ref_low: float,
+                opts: 'Opts | None' = None) -> Signal:
     entry = c.close
     if bias == 'LONG':
         sl   = ob["low"]  - TICK
-        tp1  = ref_high
         risk = entry - sl
-        tp2r = entry + 2.0 * risk
-        tp2  = tp2r if tp2r > tp1 else tp1 + risk
+        if opts and opts.sweep_tp1_r > 0 and interaction == 'SWEEP':
+            tp1 = entry + opts.sweep_tp1_r * risk   # fixed-R partial exit
+            tp2 = ref_high                           # original big target
+        else:
+            tp1  = ref_high
+            tp2r = entry + 2.0 * risk
+            tp2  = tp2r if tp2r > tp1 else tp1 + risk
     else:
         sl   = ob["high"] + TICK
-        tp1  = ref_low
         risk = sl - entry
-        tp2r = entry - 2.0 * risk
-        tp2  = tp2r if tp2r < tp1 else tp1 - risk
+        if opts and opts.sweep_tp1_r > 0 and interaction == 'SWEEP':
+            tp1 = entry - opts.sweep_tp1_r * risk   # fixed-R partial exit
+            tp2 = ref_low                            # original big target
+        else:
+            tp1  = ref_low
+            tp2r = entry - 2.0 * risk
+            tp2  = tp2r if tp2r < tp1 else tp1 - risk
     rr1 = abs(tp1 - entry) / risk if risk else 0
     rr2 = abs(tp2 - entry) / risk if risk else 0
     return Signal(ts=c.ts, bias=bias, interaction=interaction,
@@ -290,6 +302,10 @@ def sim_day(day_1m: list[Candle], day_5m: list[Candle], opts: Opts) -> list[Sign
             if recovered:
                 bias        = 'SHORT' if bias == 'LONG' else 'LONG'
                 interaction = 'SWEEP'
+                # OPT BKOUT: recovery turns a BREAKOUT into SWEEP — skip it
+                if opts.breakout_only:
+                    state = 'RANGE_LOCKED'; bias = None; ob = None
+                    continue
             else:
                 interaction = 'BREAKOUT'
             inter_h = candle.high
@@ -362,7 +378,7 @@ def sim_day(day_1m: list[Candle], day_5m: list[Candle], opts: Opts) -> list[Sign
                 state = 'RANGE_LOCKED'; ob = None; bias = None
                 continue
             if wick_reject(candle, ob, bias):
-                signals.append(make_signal(candle, bias, interaction, ob, c_ref_h, c_ref_l))
+                signals.append(make_signal(candle, bias, interaction, ob, c_ref_h, c_ref_l, opts))
                 # OPT5: no re-interaction after first signal
                 if opts.no_reinteract:
                     break
@@ -439,6 +455,8 @@ VARIANT_DEFS = {
     'OPT5':   Opts(no_reinteract=True),
     'COMB13': None,   # OPT1 + OPT3, set from args
     'BKOUT':  Opts(), # BREAKOUT-only (SWEEP disabled in sim_day via flag)
+    'OPT6':   Opts(sweep_tp1_r=2.0),  # SWEEP TP1=2R, TP2=ref_high
+    'OPT7':   Opts(sweep_tp1_r=3.0),  # SWEEP TP1=3R, TP2=ref_high
 }
 
 VARIANT_DESC = {
@@ -450,6 +468,8 @@ VARIANT_DESC = {
     'OPT5':   'no re-interaction after signal',
     'COMB13': 'OPT1 + OPT3 combined',
     'BKOUT':  'BREAKOUT signals only (no SWEEP)',
+    'OPT6':   'SWEEP TP1=2R fixed, TP2=ref_high',
+    'OPT7':   'SWEEP TP1=3R fixed, TP2=ref_high',
 }
 
 def main():
