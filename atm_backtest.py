@@ -81,6 +81,7 @@ class Opts:
     sweep_ob_min_body:    float = -1.0  # SWEEP-specific ob_min_body
     bo_dynamic_invalid:   bool  = False # BREAKOUT-specific dynamic_invalid
     bo_choch_body_filter: bool  = False # BREAKOUT-specific choch_body_filter
+    stop_at_london:    bool  = False  # cut scan at London open (Tokyo+4h)
 
     def eff_dynamic(self, interaction: str) -> bool:
         if interaction == 'BREAKOUT':
@@ -373,8 +374,9 @@ def sim_day(day_1m: list[Candle], day_5m: list[Candle], opts: Opts) -> list[Sign
     ref_h = tok_h if tok_locked else asia_h
     ref_l = tok_l if tok_locked else asia_l
 
+    scan_end = (w["te"] + 4 * 60) if (opts and opts.stop_at_london) else w["us"]
     post_asia = [c for c in day_1m
-                 if w["ae"] <= mod(c.ts.time()) < w["us"]]
+                 if w["ae"] <= mod(c.ts.time()) < scan_end]
 
     state      = 'RANGE_LOCKED'
     bias       = None
@@ -391,9 +393,10 @@ def sim_day(day_1m: list[Candle], day_5m: list[Candle], opts: Opts) -> list[Sign
         in_tok     = w["ts"] <= m < w["te"]
         post_tok   = m >= w["te"]
 
-        # Per-candle ref range
-        c_ref_h = ref_h
-        c_ref_l = ref_l
+        # Per-candle ref range — matches live bot: only use Tokyo range after Tokyo closes
+        candle_tok_locked = post_tok and tok_h is not None and (tok_h > asia_h or tok_l < asia_l)
+        c_ref_h = tok_h if candle_tok_locked else asia_h
+        c_ref_l = tok_l if candle_tok_locked else asia_l
 
         # ── RANGE_LOCKED ──────────────────────────────────────────
         if state == 'RANGE_LOCKED':
@@ -582,6 +585,7 @@ VARIANT_DEFS = {
     'COMB23':   None,  # OPT2 + OPT3 applied to all, set from args
     'COMBSB31': None,  # SWEEP=OPT3, BREAKOUT=OPT1, set from args
     'COMBSB32': None,  # SWEEP=OPT3, BREAKOUT=OPT2, set from args
+    'TOKCUT':   None,  # BASE but scan stops at London open (Tokyo+4h)
 }
 
 VARIANT_DESC = {
@@ -598,6 +602,7 @@ VARIANT_DESC = {
     'COMB23':   'OPT2 + OPT3 (CHoCH body + OB body, all signals)',
     'COMBSB31': 'SWEEP=OPT3 (ob_min_body), BREAKOUT=OPT1 (dynamic invalid)',
     'COMBSB32': 'SWEEP=OPT3 (ob_min_body), BREAKOUT=OPT2 (CHoCH body filter)',
+    'TOKCUT':   'scan stops at London open (Asia+Post-Asia+Tokyo-KZ only)',
 }
 
 def main():
@@ -628,6 +633,8 @@ def main():
     VARIANT_DESC['COMBSB31'] = f'SWEEP=OPT3(ob>={mb}), BREAKOUT=OPT1(dynamic invalid)'
     VARIANT_DEFS['COMBSB32'] = Opts(sweep_ob_min_body=mb, bo_choch_body_filter=True)
     VARIANT_DESC['COMBSB32'] = f'SWEEP=OPT3(ob>={mb}), BREAKOUT=OPT2(CHoCH body)'
+    VARIANT_DEFS['TOKCUT']   = Opts(stop_at_london=True)
+    VARIANT_DESC['TOKCUT']   = 'BASE + scan stops at London open (Post-Tokyo/London/NY dropped)'
 
     now      = datetime.now(tz=TW_TZ)
     start    = now - timedelta(days=args.days)
