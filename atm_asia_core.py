@@ -263,7 +263,7 @@ def is_inside_asia_range(candle: Candle, asia_high: float, asia_low: float) -> b
     return candle.high <= asia_high and candle.low >= asia_low
 
 
-def find_ob(candles: List[Candle], bias: Bias, lookback: int = 10) -> Optional[OrderBlock]:
+def find_ob(candles: List[Candle], bias: Bias, lookback: int = 30) -> Optional[OrderBlock]:
     """
     Finds the last opposite-color candle before the displacement.
     LONG  → last bearish (red) candle in lookback window
