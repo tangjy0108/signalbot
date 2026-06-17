@@ -1032,6 +1032,40 @@ def fetch_atm_live_price(symbol: str, interval: str) -> float:
     return float(latest["close"])
 
 
+def atm_signal_stats_by_interaction(
+    conn: sqlite3.Connection, where_sql: str = "", params: tuple[object, ...] = ()
+) -> list[sqlite3.Row]:
+    """Stats grouped by interaction type (SWEEP / BREAKOUT) with PF."""
+    conn.row_factory = sqlite3.Row
+    sql = f"""
+        SELECT
+            interaction,
+            COUNT(*) AS signals,
+            SUM(CASE WHEN final_outcome IS NOT NULL THEN 1 ELSE 0 END) AS closed_signals,
+            SUM(CASE WHEN final_outcome IN ('TP1','TP2') THEN 1 ELSE 0 END) AS wins,
+            SUM(CASE WHEN final_outcome='SL'  THEN 1 ELSE 0 END) AS final_sl,
+            SUM(CASE WHEN final_outcome='TP1' THEN 1 ELSE 0 END) AS final_tp1,
+            SUM(CASE WHEN final_outcome='TP2' THEN 1 ELSE 0 END) AS final_tp2,
+            SUM(CASE
+                WHEN final_outcome='TP2' THEN 0.75*rr_tp1 + 0.25*rr_tp2
+                WHEN final_outcome='TP1' THEN 0.75*rr_tp1 - 0.25
+                ELSE 0.0
+            END) AS gross_profit_r,
+            SUM(CASE
+                WHEN final_outcome='SL' THEN 1.0
+                WHEN final_outcome='TP1' AND 0.75*rr_tp1 < 0.25 THEN 0.25 - 0.75*rr_tp1
+                ELSE 0.0
+            END) AS gross_loss_r
+        FROM atm_signals
+        {where_sql}
+        GROUP BY interaction
+        ORDER BY interaction
+    """
+    rows = conn.execute(sql, params).fetchall()
+    conn.row_factory = None
+    return rows
+
+
 def atm_signal_stats(conn: sqlite3.Connection, where_sql: str = "", params: tuple[object, ...] = ()) -> sqlite3.Row:
     conn.row_factory = sqlite3.Row
     sql = f"""
@@ -1062,11 +1096,32 @@ def build_atm_summary_message(conn: sqlite3.Connection, now_tw: datetime) -> str
         "WHERE date(signal_time_utc, '+8 hours') = ?",
         (today_tw,),
     )
+    by_type = atm_signal_stats_by_interaction(conn)
 
     def win_rate(row: sqlite3.Row) -> float:
         closed = int(row["closed_signals"] or 0)
         wins = int(row["wins"] or 0)
         return round((wins / closed * 100), 1) if closed else 0.0
+
+    def pf(row: sqlite3.Row) -> str:
+        gp = float(row["gross_profit_r"] or 0)
+        gl = float(row["gross_loss_r"] or 0)
+        if gl == 0:
+            return "∞" if gp > 0 else "–"
+        return f"{gp / gl:.2f}"
+
+    type_lines = []
+    for r in by_type:
+        closed = int(r["closed_signals"] or 0)
+        if closed == 0:
+            continue
+        wr = round(int(r["wins"] or 0) / closed * 100, 1)
+        type_lines.append(
+            f"  {r['interaction']:9s} {closed:3d}筆  勝率 {wr:.0f}%"
+            f"  PF {pf(r)}"
+            f"  (TP2 {int(r['final_tp2'] or 0)} / TP1 {int(r['final_tp1'] or 0)} / SL {int(r['final_sl'] or 0)})"
+        )
+    type_section = "\n".join(type_lines) if type_lines else "  尚無已完成交易"
 
     return (
         f"📊 ATM 夜間統計 {today_tw}\n"
@@ -1077,7 +1132,9 @@ def build_atm_summary_message(conn: sqlite3.Connection, now_tw: datetime) -> str
         f"歷史 signals: {int(overall['signals'] or 0)}  已完成: {int(overall['closed_signals'] or 0)}\n"
         f"歷史勝率: {win_rate(overall):.1f}%\n"
         f"歷史最終結果: TP2 {int(overall['final_tp2'] or 0)} / TP1 {int(overall['final_tp1'] or 0)} / SL {int(overall['final_sl'] or 0)}\n"
-        f"歷史觸及次數: TP1 {int(overall['hit_tp1'] or 0)} / TP2 {int(overall['hit_tp2'] or 0)} / SL {int(overall['hit_sl'] or 0)}"
+        f"歷史觸及次數: TP1 {int(overall['hit_tp1'] or 0)} / TP2 {int(overall['hit_tp2'] or 0)} / SL {int(overall['hit_sl'] or 0)}\n"
+        f"── SWEEP vs BREAKOUT（歷史）──\n"
+        f"{type_section}"
     )
 
 
