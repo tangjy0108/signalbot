@@ -1333,6 +1333,7 @@ def _atm_thread(cfg: Config) -> None:
             process_candle, should_daily_reset,
             build_range_locked_msg, build_ob_found_msg,
             build_tokyo_range_locked_msg, build_ob_invalidated_msg,
+            build_interaction_msg, build_choch_confirmed_msg, build_ob_retest_msg,
             kill_zone_windows, is_trade_day, SYMBOL as ATM_SYMBOL, TW_TZ,
         )
     except ImportError as exc:
@@ -1430,7 +1431,7 @@ def _atm_thread(cfg: Config) -> None:
                     if not first_run:
                         send_telegram(cfg, build_tokyo_range_locked_msg(ctx))
 
-                # state-change notifications (suppressed on first run to avoid replaying history)
+                # state-change notifications (range lock only — others come from process_candle)
                 if ctx.state != prev_state:
                     LOGGER.info("[ATM] state %s → %s", prev_state, ctx.state)
                     if not first_run:
@@ -1439,13 +1440,12 @@ def _atm_thread(cfg: Config) -> None:
                             ATMState.ASIA_RANGE_FORMING,
                         }:
                             send_telegram(cfg, build_range_locked_msg(ctx))
-                        elif ctx.state == ATMState.WAITING_RETEST and prev_state != ATMState.SIGNAL_FIRED:
-                            send_telegram(cfg, build_ob_found_msg(ctx) + f"\n_[debug] from: {prev_state}_")
                     prev_state = ctx.state
 
                 if signal and not first_run:
-                    # ── OB invalidation notification (no DB write) ──
-                    if signal.get("notification_type") == "OB_INVALIDATED":
+                    # ── informational notifications (no DB write) ──
+                    _NOTIFY_TYPES = {"OB_INVALIDATED", "INTERACTION_DETECTED", "CHOCH_CONFIRMED", "OB_RETEST"}
+                    if signal.get("notification_type") in _NOTIFY_TYPES:
                         send_telegram(cfg, signal["telegram_message"])
                         continue
 
@@ -1503,8 +1503,11 @@ def _atm_thread(cfg: Config) -> None:
                             send_telegram(cfg, format_trade_error(str(_te)))
 
             # After first batch: catch-up notification if bot started mid-session
-            if first_run and ctx.state in {ATMState.WAITING_RETEST, ATMState.WAITING_WICK}:
-                send_telegram(cfg, build_ob_found_msg(ctx) + "\n_[startup catch-up]_")
+            if first_run:
+                if ctx.state in {ATMState.WAITING_RETEST, ATMState.WAITING_WICK}:
+                    send_telegram(cfg, build_ob_found_msg(ctx) + "\n_[startup catch-up]_")
+                elif ctx.state in {ATMState.WAITING_CHOCH, ATMState.WAITING_BREAKOUT_CONFIRM}:
+                    send_telegram(cfg, build_range_locked_msg(ctx) + f"\n_[startup catch-up: 等待CHoCH ({ctx.state})]_")
             first_run = False  # after first batch, enable notifications
 
         except Exception as exc:

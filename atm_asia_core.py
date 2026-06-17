@@ -57,10 +57,12 @@ def is_trade_day(dt: datetime) -> bool:
 class ATMState(str, Enum):
     IDLE              = "IDLE"
     ASIA_RANGE_FORMING = "ASIA_RANGE_FORMING"
-    ASIA_RANGE_LOCKED  = "ASIA_RANGE_LOCKED"
-    WAITING_RETEST    = "WAITING_RETEST"
-    WAITING_WICK      = "WAITING_WICK"
-    SIGNAL_FIRED      = "SIGNAL_FIRED"
+    ASIA_RANGE_LOCKED        = "ASIA_RANGE_LOCKED"
+    WAITING_BREAKOUT_CONFIRM = "WAITING_BREAKOUT_CONFIRM"
+    WAITING_CHOCH            = "WAITING_CHOCH"
+    WAITING_RETEST           = "WAITING_RETEST"
+    WAITING_WICK             = "WAITING_WICK"
+    SIGNAL_FIRED             = "SIGNAL_FIRED"
 
 
 class Bias(str, Enum):
@@ -127,10 +129,13 @@ class ATMContext:
     sl:               Optional[float] = None
     tp1:              Optional[float] = None   # Range High/Low target
     tp2:              Optional[float] = None   # 1:2 R:R target
-    signal_sent:      bool = False
-    last_interaction_side: Optional[str] = None
-    interaction_rearmed: bool = False
-    us_expired:       bool = False   # True after US session opens; cleared by daily reset
+    signal_sent:             bool = False
+    last_interaction_side:   Optional[str] = None
+    interaction_rearmed:     bool = False
+    us_expired:              bool = False   # True after US session opens; cleared by daily reset
+    interaction_candle_high: float = 0.0   # high of the candle that triggered interaction
+    interaction_candle_low:  float = 0.0   # low of the candle that triggered interaction
+    ob_timeframe:            str = "1m"    # "1m" or "5m" depending on Tokyo session
     checklist: dict = field(default_factory=lambda: {
         "time_filter":   False,
         "asia_range":    False,
@@ -318,39 +323,55 @@ def _reset_setup_progress(ctx: ATMContext) -> None:
     ctx.ref_high = 0.0
     ctx.ref_low = 0.0
     ctx.signal_sent = False
+    ctx.interaction_candle_high = 0.0
+    ctx.interaction_candle_low  = 0.0
+    ctx.ob_timeframe = "1m"
     ctx.checklist["interaction"] = False
     ctx.checklist["ob_found"] = False
     ctx.checklist["retest"] = False
     ctx.checklist["wick_rejection"] = False
 
 
-def _start_interaction_setup(
+def _start_choch_wait(
     candle: Candle,
     ctx: ATMContext,
-    history: List[Candle],
     interaction: InteractionType,
     bias: Bias,
     side: str,
 ) -> None:
+    """SWEEP path: interaction confirmed in 1 candle → wait for CHoCH."""
     _reset_setup_progress(ctx)
-    # Capture active reference range at setup time (Tokyo if locked, else Asia)
     ctx.ref_high = ctx.tokyo_high if ctx.tokyo_range_locked else ctx.asia_high
     ctx.ref_low  = ctx.tokyo_low  if ctx.tokyo_range_locked else ctx.asia_low
     ctx.interaction = interaction
     ctx.bias = bias
     ctx.last_interaction_side = side
     ctx.interaction_rearmed = False
+    ctx.interaction_candle_high = candle.high
+    ctx.interaction_candle_low  = candle.low
     ctx.checklist["interaction"] = True
-    log.info(f"[ATM] {ctx.interaction.value} → {ctx.bias.value} (ref H={ctx.ref_high:.2f} L={ctx.ref_low:.2f})")
-    ob = find_ob(history, ctx.bias)
-    if ob:
-        ctx.ob = ob
-        ctx.checklist["ob_found"] = True
-        ctx.state = ATMState.WAITING_RETEST
-        log.info(f"[ATM] OB  H={ob.high:.2f}  L={ob.low:.2f}")
-    else:
-        ctx.state = ATMState.ASIA_RANGE_LOCKED
-        log.warning("[ATM] interaction detected but no OB found")
+    ctx.state = ATMState.WAITING_CHOCH
+    log.info(f"[ATM] {interaction.value} → {bias.value} | WAITING_CHOCH (candle H={candle.high:.2f} L={candle.low:.2f})")
+
+
+def _start_breakout_confirm(
+    candle: Candle,
+    ctx: ATMContext,
+    bias: Bias,
+    side: str,
+) -> None:
+    """BREAKOUT path: wait 1 confirmation candle before deciding BREAKOUT vs SWEEP."""
+    _reset_setup_progress(ctx)
+    ctx.ref_high = ctx.tokyo_high if ctx.tokyo_range_locked else ctx.asia_high
+    ctx.ref_low  = ctx.tokyo_low  if ctx.tokyo_range_locked else ctx.asia_low
+    ctx.interaction = InteractionType.BREAKOUT
+    ctx.bias = bias
+    ctx.last_interaction_side = side
+    ctx.interaction_rearmed = False
+    ctx.interaction_candle_high = candle.high
+    ctx.interaction_candle_low  = candle.low
+    ctx.state = ATMState.WAITING_BREAKOUT_CONFIRM
+    log.info(f"[ATM] BREAKOUT → {bias.value} | WAITING_BREAKOUT_CONFIRM (1 candle)")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -435,69 +456,118 @@ def process_candle(
             side = interaction_side(candle, ref_high, ref_low)
             if side:
                 interaction, bias = result
-                _start_interaction_setup(candle, ctx, history, interaction, bias, side)
+                if interaction == InteractionType.SWEEP:
+                    _start_choch_wait(candle, ctx, interaction, bias, side)
+                    return build_interaction_msg(ctx, candle)
+                else:  # BREAKOUT: wait 1 confirmation candle
+                    _start_breakout_confirm(candle, ctx, bias, side)
         return None
 
-    # ── Phase 3: wait for displacement then retest ───────────────
-    if ctx.state == ATMState.WAITING_RETEST:
-        if ob_invalidated(candle, ctx.ob):
-            log.warning("[ATM] OB invalidated — trying Reversal OB")
-            old_bias = ctx.bias
-            old_ob   = ctx.ob
-            rev_bias = Bias.SHORT if ctx.bias == Bias.LONG else Bias.LONG
-            rev_ob   = find_ob(history, rev_bias, lookback=5)
-            if rev_ob:
-                ctx.bias      = rev_bias
-                ctx.ob        = rev_ob
-                ctx.displaced = False
-                log.info(f"[ATM] Reversal OB  H={rev_ob.high:.2f}  L={rev_ob.low:.2f}")
+    # ── Phase 2.5: BREAKOUT confirmation (1 candle) ───────────────
+    if ctx.state == ATMState.WAITING_BREAKOUT_CONFIRM:
+        recovered = False
+        if ctx.bias == Bias.LONG and candle.close < ctx.ref_high:
+            recovered = True
+            ctx.bias = Bias.SHORT   # false breakout above → SHORT sweep
+        elif ctx.bias == Bias.SHORT and candle.close > ctx.ref_low:
+            recovered = True
+            ctx.bias = Bias.LONG    # false breakout below → LONG sweep
+        # Update CHoCH reference to the confirmation candle
+        ctx.interaction_candle_high = candle.high
+        ctx.interaction_candle_low  = candle.low
+        if recovered:
+            ctx.interaction = InteractionType.SWEEP
+        ctx.checklist["interaction"] = True
+        ctx.state = ATMState.WAITING_CHOCH
+        log.info(f"[ATM] Breakout {'recovered→SWEEP' if recovered else 'confirmed'} {ctx.bias.value}")
+        return build_interaction_msg(ctx, candle, recovered)
+
+    # ── Phase 3: wait for CHoCH, then find OB ────────────────────
+    if ctx.state == ATMState.WAITING_CHOCH:
+        # Invalidation: price closed beyond interaction candle (wrong direction)
+        if ctx.bias == Bias.LONG and candle.close < ctx.interaction_candle_low:
+            _reset_setup_progress(ctx)
+            ctx.state = ATMState.ASIA_RANGE_LOCKED
+            log.info("[ATM] WAITING_CHOCH invalidated (LONG) — back to ASIA_RANGE_LOCKED")
+            return None
+        if ctx.bias == Bias.SHORT and candle.close > ctx.interaction_candle_high:
+            _reset_setup_progress(ctx)
+            ctx.state = ATMState.ASIA_RANGE_LOCKED
+            log.info("[ATM] WAITING_CHOCH invalidated (SHORT) — back to ASIA_RANGE_LOCKED")
+            return None
+        # CHoCH confirmation
+        choch = (
+            (ctx.bias == Bias.LONG  and candle.close > ctx.interaction_candle_high) or
+            (ctx.bias == Bias.SHORT and candle.close < ctx.interaction_candle_low)
+        )
+        if choch:
+            use_5m = post_tokyo
+            if use_5m:
+                klines_5m = fetch_klines(SYMBOL, "5m", 60)
+                ob = find_ob(klines_5m, ctx.bias) if klines_5m else find_ob(history, ctx.bias)
+                ctx.ob_timeframe = "5m"
+            else:
+                ob = find_ob(history, ctx.bias)
+                ctx.ob_timeframe = "1m"
+            if ob:
+                ctx.ob = ob
+                ctx.displaced = True   # price already displaced from OB at CHoCH
+                ctx.state = ATMState.WAITING_RETEST
+                ctx.checklist["ob_found"] = True
+                log.info(f"[ATM] CHoCH confirmed ({ctx.ob_timeframe}) → OB H={ob.high:.2f} L={ob.low:.2f}")
+                return build_choch_confirmed_msg(ctx, candle)
             else:
                 _reset_setup_progress(ctx)
-                ctx.state = ATMState.ASIA_RANGE_LOCKED  # keep watching like soup does
-                log.info("[ATM] No reversal OB — back to ASIA_RANGE_LOCKED")
-            return build_ob_invalidated_msg(old_bias, old_ob, candle, "等待回踩中", rev_ob)
+                ctx.state = ATMState.ASIA_RANGE_LOCKED
+                log.warning("[ATM] CHoCH confirmed but no OB found — back to ASIA_RANGE_LOCKED")
+        return None
 
-        # Step A: wait for displacement away from OB before accepting a retest
-        if not ctx.displaced:
-            if ctx.bias == Bias.LONG and candle.close > ctx.ob.high:
-                ctx.displaced = True
-                log.info(f"[ATM] Displacement confirmed (close={candle.close:.2f} > OB.high={ctx.ob.high:.2f})")
-            elif ctx.bias == Bias.SHORT and candle.close < ctx.ob.low:
-                ctx.displaced = True
-                log.info(f"[ATM] Displacement confirmed (close={candle.close:.2f} < OB.low={ctx.ob.low:.2f})")
-            if not ctx.displaced:
-                return None
-            # just confirmed displacement — fall through to check OB zone on same candle
-
-        # Step B: price returns to OB zone after displacement
+    # ── Phase 4: wait for OB retest ──────────────────────────────
+    if ctx.state == ATMState.WAITING_RETEST:
+        if ob_invalidated(candle, ctx.ob):
+            log.warning("[ATM] OB invalidated during retest wait — back to ASIA_RANGE_LOCKED")
+            old_bias = ctx.bias
+            old_ob   = ctx.ob
+            _reset_setup_progress(ctx)
+            ctx.state = ATMState.ASIA_RANGE_LOCKED
+            return build_ob_invalidated_msg(old_bias, old_ob, candle, "等待回踩中")
+        # displaced=True from CHoCH; skip displacement check
         if is_in_ob_zone(candle, ctx.ob):
             ctx.state = ATMState.WAITING_WICK
             ctx.checklist["retest"] = True
             log.info(f"[ATM] Price retested OB zone @ {candle.close:.2f}")
-            # fall through — check wick rejection on same candle
-        else:
-            return None
+            # If wick rejection happens on the same retest candle, fire signal immediately
+            if detect_wick_rejection(candle, ctx.ob):
+                ctx.checklist["wick_rejection"] = True
+                ctx.state = ATMState.SIGNAL_FIRED
+                _calculate_levels(ctx, candle)
+                sig = _build_signal(ctx, candle)
+                ctx.signal_sent = True
+                log.info(f"[ATM] SIGNAL (on retest candle) {ctx.bias.value} entry={ctx.entry:.2f}")
+                return sig
+            return build_ob_retest_msg(ctx, candle)
+        return None
 
-    # ── Phase 4: wick rejection → fire signal ───────────────────
+    # ── Phase 5: wick rejection → fire signal ────────────────────
     if ctx.state == ATMState.WAITING_WICK:
         if ob_invalidated(candle, ctx.ob):
             log.warning("[ATM] OB invalidated during wick wait — back to ASIA_RANGE_LOCKED")
             old_bias = ctx.bias
             old_ob   = ctx.ob
             _reset_setup_progress(ctx)
-            ctx.state = ATMState.ASIA_RANGE_LOCKED  # keep watching like soup does
+            ctx.state = ATMState.ASIA_RANGE_LOCKED
             return build_ob_invalidated_msg(old_bias, old_ob, candle, "等待影線拒絕中")
 
         if detect_wick_rejection(candle, ctx.ob):
             ctx.checklist["wick_rejection"] = True
             ctx.state = ATMState.SIGNAL_FIRED
             _calculate_levels(ctx, candle)
-            signal = _build_signal(ctx, candle)
+            sig = _build_signal(ctx, candle)
             ctx.signal_sent = True
             log.info(f"[ATM] SIGNAL {ctx.bias.value}  entry={ctx.entry:.2f}  SL={ctx.sl:.2f}  TP1={ctx.tp1:.2f}  TP2={ctx.tp2:.2f}")
-            return signal
+            return sig
 
-    # ── Phase 5: signal fired — watch for re-breakout ────────────
+    # ── Phase 6: signal fired — watch for re-breakout ────────────
     if ctx.state == ATMState.SIGNAL_FIRED:
         if is_inside_asia_range(candle, ref_high, ref_low):
             ctx.interaction_rearmed = True
@@ -510,10 +580,12 @@ def process_candle(
         re_result = detect_interaction(candle, ref_high, ref_low)
         if re_result and ctx.interaction_rearmed:
             new_interaction, new_bias = re_result
-            log.info(
-                f"[ATM] New interaction after signal → {new_interaction.value} {new_bias.value}"
-            )
-            _start_interaction_setup(candle, ctx, history, new_interaction, new_bias, side)
+            log.info(f"[ATM] New interaction after signal → {new_interaction.value} {new_bias.value}")
+            if new_interaction == InteractionType.SWEEP:
+                _start_choch_wait(candle, ctx, new_interaction, new_bias, side)
+                return build_interaction_msg(ctx, candle)
+            else:
+                _start_breakout_confirm(candle, ctx, new_bias, side)
 
     return None
 
@@ -666,6 +738,62 @@ def build_tokyo_range_locked_msg(ctx: ATMContext) -> str:
         f"━━━━━━━━━━━━━━━━\n"
         f"{lines}"
     )
+
+
+def build_interaction_msg(ctx: "ATMContext", candle: "Candle", recovered: bool = False) -> dict:
+    """Sent when SWEEP is detected or BREAKOUT confirmation candle arrives."""
+    direction = "📈 LONG" if ctx.bias == Bias.LONG else "📉 SHORT"
+    time_str  = candle.ts.astimezone(TW_TZ).strftime("%H:%M")
+    range_name = "Tokyo" if ctx.tokyo_range_locked else "Asia"
+    ref_h = ctx.ref_high if ctx.ref_high > 0 else ctx.asia_high
+    ref_l = ctx.ref_low  if ctx.ref_low  > 0 else ctx.asia_low
+    if recovered:
+        interaction_label = "假突破 → SWEEP"
+    elif ctx.interaction == InteractionType.SWEEP:
+        interaction_label = "假突破 (SWEEP)"
+    else:
+        interaction_label = "突破 (BREAKOUT)"
+    msg = (
+        f"🔍 *ATM 互動偵測 — {ctx.bias.value}* {direction}\n"
+        f"模式：{interaction_label}\n"
+        f"{range_name} High：`{ref_h:.0f}`  Low：`{ref_l:.0f}`\n"
+        f"等待 CHoCH（結構轉換）...\n"
+        f"_⏰ TW {time_str}_"
+    )
+    return {"notification_type": "INTERACTION_DETECTED", "telegram_message": msg}
+
+
+def build_choch_confirmed_msg(ctx: "ATMContext", candle: "Candle") -> dict:
+    """Sent when CHoCH is confirmed and OB is found."""
+    direction = "📈 LONG" if ctx.bias == Bias.LONG else "📉 SHORT"
+    time_str  = candle.ts.astimezone(TW_TZ).strftime("%H:%M")
+    range_name = "Tokyo" if ctx.tokyo_range_locked else "Asia"
+    ref_h = ctx.ref_high if ctx.ref_high > 0 else ctx.asia_high
+    ref_l = ctx.ref_low  if ctx.ref_low  > 0 else ctx.asia_low
+    ob    = ctx.ob
+    msg = (
+        f"📐 *ATM CHoCH 確認 — {ctx.bias.value}* {direction}\n"
+        f"OB 區間：`{ob.low:.2f} – {ob.high:.2f}`  _({ctx.ob_timeframe} K)_\n"
+        f"{range_name} High：`{ref_h:.0f}`  Low：`{ref_l:.0f}`\n"
+        f"等待回踩 OB...\n"
+        f"_⏰ TW {time_str}_"
+    )
+    return {"notification_type": "CHOCH_CONFIRMED", "telegram_message": msg}
+
+
+def build_ob_retest_msg(ctx: "ATMContext", candle: "Candle") -> dict:
+    """Sent when price enters OB zone for the first time after CHoCH."""
+    direction = "📈 LONG" if ctx.bias == Bias.LONG else "📉 SHORT"
+    time_str  = candle.ts.astimezone(TW_TZ).strftime("%H:%M")
+    ob = ctx.ob
+    msg = (
+        f"🔄 *ATM 回踩 OB — {ctx.bias.value}* {direction}\n"
+        f"OB 區間：`{ob.low:.2f} – {ob.high:.2f}`\n"
+        f"現價：`{candle.close:.2f}`\n"
+        f"等待 Wick Rejection...\n"
+        f"_⏰ TW {time_str}_"
+    )
+    return {"notification_type": "OB_RETEST", "telegram_message": msg}
 
 
 def _build_us_expired_msg(ctx: "ATMContext", candle: "Candle") -> dict:
