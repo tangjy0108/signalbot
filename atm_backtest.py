@@ -273,6 +273,19 @@ def windows(dt: datetime) -> dict:
 def is_weekend(dt: datetime) -> bool:
     return dt.weekday() >= 5
 
+def classify_session(ts: datetime) -> str:
+    """Return which trading session the signal fired in (TW time)."""
+    w  = windows(ts)
+    m  = mod(ts.time())
+    # London open ≈ 4h after Tokyo close (15:00 TW summer / 16:00 TW winter)
+    london = w["te"] + 4 * 60
+    if m < w["ae"]:               return "Asia-KZ"
+    elif m < w["ts"]:             return "Post-Asia"
+    elif m < w["te"]:             return "Tokyo-KZ"
+    elif m < london:              return "Post-Tokyo"
+    elif m < w["us"]:             return "London/Pre-NY"
+    else:                         return "NY+"
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ATM helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -738,6 +751,35 @@ def main():
             avg_tp2  = sum(tp2_dist) / len(tp2_dist)
             avg_rr1  = sum(rr1s)    / len(rr1s)
             print(f"{itype:<9} {len(sigs):>4}  {avg_r:>8.1f}  {avg_tp1:>10.1f}  {avg_tp2:>10.1f}  {avg_rr1:>8.2f}R")
+
+    # ── Session breakdown (BASE only) ──
+    if 'BASE' in active_variants:
+        sessions = ["Post-Asia", "Tokyo-KZ", "Post-Tokyo", "London/Pre-NY", "NY+"]
+        print()
+        print("── Signal session breakdown — BASE ──")
+        print(f"{'Session':<16} {'All':>5} {'SWEEP':>7} {'BREAKOUT':>9}  {'AvgR':>6}  TW time (summer/winter)")
+        print("─" * 70)
+        session_map = {s: [] for s in sessions}
+        for sig, outcome in results['BASE']:
+            sess = classify_session(sig.ts)
+            session_map.setdefault(sess, []).append((sig, outcome))
+        for sess in sessions:
+            pairs = session_map.get(sess, [])
+            if not pairs:
+                continue
+            closed = [(s, o) for s, o in pairs if o != 'OPEN']
+            n_sw = sum(1 for s, _ in pairs if s.interaction == 'SWEEP')
+            n_bo = sum(1 for s, _ in pairs if s.interaction == 'BREAKOUT')
+            st   = calc_stats(closed) if closed else None
+            avgr = f"{st['avgr']:>+.2f}R" if st else "  n/a"
+            tw_hint = {
+                "Post-Asia":     " 7-9h / 8-10h TW",
+                "Tokyo-KZ":      "9-10h / 10-11h TW",
+                "Post-Tokyo":    "10-14h / 11-15h TW",
+                "London/Pre-NY": "14-21h / 15-22h TW",
+                "NY+":           "21h+ / 22h+ TW",
+            }.get(sess, "")
+            print(f"{sess:<16} {len(pairs):>5} {n_sw:>7} {n_bo:>9}  {avgr}  {tw_hint}")
 
     # OPEN count (not yet resolved in the 200-candle window)
     print()
