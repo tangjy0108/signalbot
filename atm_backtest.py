@@ -75,9 +75,9 @@ class Opts:
 # ─────────────────────────────────────────────────────────────────────────────
 def fetch_range(symbol: str, interval: str, start_ms: int, end_ms: int) -> list[Candle]:
     """Paginate backwards from end_ms → start_ms (BingX returns newest-first)."""
-    rows    = []
-    cur_end = end_ms
-    pages   = 0
+    rows      = []
+    cur_end   = end_ms
+    prev_oldest = None
 
     while True:
         try:
@@ -91,17 +91,32 @@ def fetch_range(symbol: str, interval: str, start_ms: int, end_ms: int) -> list[
             print(f"  ⚠ fetch error ({interval}): {e}", file=sys.stderr)
             break
         if payload.get("code") != 0:
+            print(f"  ⚠ API error code={payload.get('code')}", file=sys.stderr)
             break
         batch = payload.get("data") or []
         if not batch:
+            print(f"  empty batch — no more data")
             break
 
-        rows.extend(batch)
-        pages += 1
-
         oldest = min(int(x["time"]) for x in batch)
+        newest = max(int(x["time"]) for x in batch)
+
+        rows.extend(batch)
+
+        oldest_dt = datetime.fromtimestamp(oldest / 1000, tz=TW_TZ).strftime('%Y-%m-%d %H:%M')
+        newest_dt = datetime.fromtimestamp(newest / 1000, tz=TW_TZ).strftime('%Y-%m-%d %H:%M')
+        print(f"  [{interval}] page {len(rows)//1000:>3}  {oldest_dt} → {newest_dt}  ({len(batch)} bars)")
+
+        # Safety: if oldest didn't move, BingX has no more history — stop
+        if oldest == prev_oldest:
+            print(f"  oldest unchanged — reached limit of available history")
+            break
+        prev_oldest = oldest
+
         if oldest <= start_ms:
-            break                    # covered the requested range
+            print(f"  reached start date — done")
+            break
+
         cur_end = oldest - 1        # next page ends just before oldest seen
         time_mod.sleep(0.35)
 
