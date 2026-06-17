@@ -25,6 +25,9 @@ from datetime import datetime, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
+import csv
+import os
+
 import requests
 
 TW_TZ    = ZoneInfo("Asia/Taipei")
@@ -32,6 +35,7 @@ NY_TZ    = ZoneInfo("America/New_York")
 SYMBOL   = "NCSINASDAQ1002USD-USDT"
 BINGX    = "https://open-api.bingx.com/openApi/swap/v2/quote/klines"
 TICK     = 0.25
+CACHE_DIR = os.path.join(os.path.dirname(__file__), "kline_cache")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data structures
@@ -159,6 +163,91 @@ def fetch_range(symbol: str, interval: str, start_ms: int, end_ms: int) -> list[
             close = float(x["close"]),
         ))
     return out
+
+# ─────────────────────────────────────────────────────────────────────────────
+# yfinance + CSV cache  (builds history over time, one chunk per run)
+# ─────────────────────────────────────────────────────────────────────────────
+def _cache_path(interval: str) -> str:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    return os.path.join(CACHE_DIR, f"NQ_{interval}.csv")
+
+def _save_cache(candles: list[Candle], interval: str):
+    path = _cache_path(interval)
+    existing = _load_cache(interval)
+    existing_ts = {c.ts for c in existing}
+    merged = existing + [c for c in candles if c.ts not in existing_ts]
+    merged.sort(key=lambda c: c.ts)
+    with open(path, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['ts', 'open', 'high', 'low', 'close'])
+        for c in merged:
+            w.writerow([c.ts.isoformat(), c.open, c.high, c.low, c.close])
+    print(f"  cache saved: {len(merged)} {interval} candles → {path}")
+
+def _load_cache(interval: str) -> list[Candle]:
+    path = _cache_path(interval)
+    if not os.path.exists(path):
+        return []
+    candles = []
+    with open(path, newline='') as f:
+        for row in csv.DictReader(f):
+            candles.append(Candle(
+                ts    = datetime.fromisoformat(row['ts']),
+                open  = float(row['open']),
+                high  = float(row['high']),
+                low   = float(row['low']),
+                close = float(row['close']),
+            ))
+    return candles
+
+def fetch_yfinance(interval: str, days: int) -> list[Candle]:
+    """Fetch NQ=F from yfinance in 7-day chunks, merge with local cache.
+    yfinance 1m limit: last 30 days. Run monthly to accumulate history.
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        print("  yfinance not installed — pip install yfinance", file=sys.stderr)
+        return []
+
+    chunk_days = 7 if interval == '1m' else 30
+    today = datetime.now(tz=TW_TZ).date()
+    all_rows: list[Candle] = []
+
+    d_end = today
+    while True:
+        d_start = d_end - timedelta(days=chunk_days)
+        df = yf.Ticker('NQ=F').history(
+            interval=interval,
+            start=str(d_start),
+            end=str(d_end),
+        )
+        if df is None or len(df) == 0:
+            break   # hit the API's age limit
+        candles = []
+        for ts, row in df.iterrows():
+            # yfinance returns UTC-aware timestamps; convert to TW
+            ts_tw = ts.tz_convert(TW_TZ) if ts.tzinfo else ts.replace(tzinfo=TW_TZ)
+            candles.append(Candle(
+                ts    = ts_tw,
+                open  = float(row['Open']),
+                high  = float(row['High']),
+                low   = float(row['Low']),
+                close = float(row['Close']),
+            ))
+        all_rows.extend(candles)
+        print(f"  [yf {interval}] {d_start} → {d_end}: {len(candles)} bars")
+        d_end = d_start
+        if (today - d_end).days >= days:
+            break
+
+    if all_rows:
+        _save_cache(all_rows, interval)
+
+    # Return cache (includes any older data from previous runs)
+    cached = _load_cache(interval)
+    cutoff = datetime.now(tz=TW_TZ) - timedelta(days=days)
+    return [c for c in cached if c.ts >= cutoff]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Time helpers
@@ -508,6 +597,9 @@ def main():
                     help='OPT4 FVG lookahead window (default 8 candles)')
     ap.add_argument('--variants',     type=str,   default='',
                     help='comma-separated variants to run, e.g. BASE,OPT3,COMBSB32 (default: all)')
+    ap.add_argument('--source',       type=str,   default='bingx',
+                    choices=['bingx', 'yfinance'],
+                    help='data source: bingx (default) or yfinance NQ=F (accumulates cache)')
     args = ap.parse_args()
 
     mb = args.ob_min_body
@@ -529,21 +621,28 @@ def main():
     start_ms = int(start.timestamp() * 1000)
     end_ms   = int(now.timestamp()   * 1000)
 
+    src = args.source
     print(f"Backtest: {args.days} days  ({start.strftime('%Y-%m-%d')} → {now.strftime('%Y-%m-%d')})")
-    print(f"Symbol  : {SYMBOL}")
+    print(f"Source  : {src.upper()}{'  (NQ=F, cache: ' + CACHE_DIR + ')' if src == 'yfinance' else '  (' + SYMBOL + ')'}")
     print()
 
-    print("Fetching 1m klines…")
-    k1m = fetch_range(SYMBOL, '1m', start_ms, end_ms)
-    if k1m:
-        print(f"  {len(k1m)} candles  ({k1m[0].ts.strftime('%Y-%m-%d')} → {k1m[-1].ts.strftime('%Y-%m-%d')})")
+    if src == 'yfinance':
+        print("Fetching 1m klines (yfinance, accumulates cache)…")
+        k1m = fetch_yfinance('1m', args.days)
+        print("Fetching 5m klines (yfinance, accumulates cache)…")
+        k5m = fetch_yfinance('5m', args.days)
     else:
-        print("  0 candles — no data available"); sys.exit(1)
+        print("Fetching 1m klines…")
+        k1m = fetch_range(SYMBOL, '1m', start_ms, end_ms)
+        print("Fetching 5m klines…")
+        k5m = fetch_range(SYMBOL, '5m', start_ms, end_ms)
 
-    print("Fetching 5m klines…")
-    k5m = fetch_range(SYMBOL, '5m', start_ms, end_ms)
+    if k1m:
+        print(f"  1m: {len(k1m)} candles  ({k1m[0].ts.strftime('%Y-%m-%d')} → {k1m[-1].ts.strftime('%Y-%m-%d')})")
+    else:
+        print("  0 1m candles — no data available"); sys.exit(1)
     if k5m:
-        print(f"  {len(k5m)} candles  ({k5m[0].ts.strftime('%Y-%m-%d')} → {k5m[-1].ts.strftime('%Y-%m-%d')})")
+        print(f"  5m: {len(k5m)} candles  ({k5m[0].ts.strftime('%Y-%m-%d')} → {k5m[-1].ts.strftime('%Y-%m-%d')})")
     else:
         print("  0 5m candles — will use 1m only")
     print()
