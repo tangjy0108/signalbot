@@ -74,13 +74,16 @@ class Opts:
 # BingX data fetch with pagination
 # ─────────────────────────────────────────────────────────────────────────────
 def fetch_range(symbol: str, interval: str, start_ms: int, end_ms: int) -> list[Candle]:
-    rows = []
-    cur  = start_ms
-    while cur < end_ms:
+    """Paginate backwards from end_ms → start_ms (BingX returns newest-first)."""
+    rows    = []
+    cur_end = end_ms
+    pages   = 0
+
+    while True:
         try:
             r = requests.get(BINGX, params={
                 "symbol": symbol, "interval": interval,
-                "limit": 1000, "startTime": cur, "endTime": end_ms,
+                "limit": 1000, "endTime": cur_end,
             }, timeout=20)
             r.raise_for_status()
             payload = r.json()
@@ -92,18 +95,22 @@ def fetch_range(symbol: str, interval: str, start_ms: int, end_ms: int) -> list[
         batch = payload.get("data") or []
         if not batch:
             break
+
         rows.extend(batch)
-        last = max(int(x["time"]) for x in batch)
-        if last <= cur:
-            break
-        cur = last + 1
+        pages += 1
+
+        oldest = min(int(x["time"]) for x in batch)
+        if oldest <= start_ms:
+            break                    # covered the requested range
+        cur_end = oldest - 1        # next page ends just before oldest seen
         time_mod.sleep(0.35)
 
-    seen  = set()
-    out   = []
+    # deduplicate, filter to [start_ms, end_ms], sort ascending
+    seen = set()
+    out  = []
     for x in sorted(rows, key=lambda r: int(r["time"])):
         t = int(x["time"])
-        if t in seen:
+        if t in seen or t < start_ms or t > end_ms:
             continue
         seen.add(t)
         out.append(Candle(
@@ -446,11 +453,17 @@ def main():
 
     print("Fetching 1m klines…")
     k1m = fetch_range(SYMBOL, '1m', start_ms, end_ms)
-    print(f"  {len(k1m)} candles")
+    if k1m:
+        print(f"  {len(k1m)} candles  ({k1m[0].ts.strftime('%Y-%m-%d')} → {k1m[-1].ts.strftime('%Y-%m-%d')})")
+    else:
+        print("  0 candles — no data available"); sys.exit(1)
 
     print("Fetching 5m klines…")
     k5m = fetch_range(SYMBOL, '5m', start_ms, end_ms)
-    print(f"  {len(k5m)} candles")
+    if k5m:
+        print(f"  {len(k5m)} candles  ({k5m[0].ts.strftime('%Y-%m-%d')} → {k5m[-1].ts.strftime('%Y-%m-%d')})")
+    else:
+        print("  0 5m candles — will use 1m only")
     print()
 
     # Group by TW date
