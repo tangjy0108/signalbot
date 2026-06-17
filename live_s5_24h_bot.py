@@ -158,12 +158,7 @@ EDGE_BREAKDOWN_VOL_SHORT_PARAMS = {
     "rr_ratio": 1.2,
 }
 
-ACTIVE_STRATEGIES = (
-    "s5",
-    "ict_killzone_opt3",
-    "edge_ny_vol_long",
-    "edge_breakdown_vol_short",
-)
+ACTIVE_STRATEGIES = ()  # ATM-only mode: S5/Killzone strategies disabled
 
 ATM_STRATEGY_ID = "atm_asia"
 ATM_STRATEGY_NAME = "ATM Asia"
