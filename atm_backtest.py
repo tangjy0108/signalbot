@@ -506,6 +506,8 @@ def main():
                     help='OPT3 min OB body in points (default 10)')
     ap.add_argument('--fvg-window',   type=int,   default=8,
                     help='OPT4 FVG lookahead window (default 8 candles)')
+    ap.add_argument('--variants',     type=str,   default='',
+                    help='comma-separated variants to run, e.g. BASE,OPT3,COMBSB32 (default: all)')
     args = ap.parse_args()
 
     mb = args.ob_min_body
@@ -556,21 +558,32 @@ def main():
     days1 = by_date(k1m)
     days5 = by_date(k5m)
 
+    # Filter to requested variants only
+    if args.variants:
+        requested = [v.strip().upper() for v in args.variants.split(',')]
+        unknown = [v for v in requested if v not in VARIANT_DEFS]
+        if unknown:
+            print(f"Unknown variants: {unknown}. Available: {list(VARIANT_DEFS)}")
+            sys.exit(1)
+        active_variants = {v: VARIANT_DEFS[v] for v in requested}
+    else:
+        active_variants = VARIANT_DEFS
+
     # Run simulation for all variants
     # variant → list of (Signal, outcome)
-    results: dict[str, list[tuple]] = {v: [] for v in VARIANT_DEFS}
+    results: dict[str, list[tuple]] = {v: [] for v in active_variants}
 
     for date_key in sorted(days1):
         d1 = days1[date_key]
         d5 = days5.get(date_key, [])
-        for vname, opts in VARIANT_DEFS.items():
+        for vname, opts in active_variants.items():
             sigs = sim_day(d1, d5, opts)
             for sig in sigs:
                 results[vname].append((sig, None))   # outcome filled below
 
     # Fill outcomes using flat future candles
     ts_to_idx = {c.ts: i for i, c in enumerate(k1m)}
-    for vname in VARIANT_DEFS:
+    for vname in active_variants:
         updated = []
         for sig, _ in results[vname]:
             i = ts_to_idx.get(sig.ts)
@@ -583,11 +596,11 @@ def main():
     print(f"{'Variant':<7} {'Trades':>6} {'Closed':>6} {'Win%':>6} "
           f"{'TP2':>4} {'TP1':>4} {'SL':>4} {'PF':>6} {'AvgR':>6}  Description")
     print("─" * 100)
-    for vname, opts in VARIANT_DEFS.items():
+    for vname, opts in active_variants.items():
         st = calc_stats(results[vname])
         pf = f"{st['pf']:.2f}" if st['pf'] != float('inf') else "  ∞"
         print(
-            f"{vname:<7} {st['total']:>6} {st['closed']:>6} {st['wr']:>5.1f}% "
+            f"{vname:<9} {st['total']:>6} {st['closed']:>6} {st['wr']:>5.1f}% "
             f"{st['tp2']:>4} {st['tp1']:>4} {st['sl']:>4} {pf:>6} {st['avgr']:>+6.2f}R"
             f"  {VARIANT_DESC[vname]}"
         )
@@ -595,9 +608,9 @@ def main():
     print()
     # Breakdown by interaction type per variant
     print("── By interaction type (closed trades only) ──")
-    print(f"{'Variant':<7} {'Type':<9} {'Closed':>6} {'Win%':>6} {'PF':>6} {'AvgR':>6}")
+    print(f"{'Variant':<9} {'Type':<9} {'Closed':>6} {'Win%':>6} {'PF':>6} {'AvgR':>6}")
     print("─" * 50)
-    for vname in VARIANT_DEFS:
+    for vname in active_variants:
         for itype in ('SWEEP', 'BREAKOUT'):
             subset = [(s, o) for s, o in results[vname]
                       if s.interaction == itype and o != 'OPEN']
@@ -605,30 +618,31 @@ def main():
                 continue
             st = calc_stats(subset)
             pf = f"{st['pf']:.2f}" if st['pf'] != float('inf') else "  ∞"
-            print(f"{vname:<7} {itype:<9} {st['closed']:>6} {st['wr']:>5.1f}% {pf:>6} {st['avgr']:>+6.2f}R")
+            print(f"{vname:<9} {itype:<9} {st['closed']:>6} {st['wr']:>5.1f}% {pf:>6} {st['avgr']:>+6.2f}R")
 
     # ── TP geometry analysis (BASE only — explains SWEEP vs BREAKOUT asymmetry) ──
-    print()
-    print("── TP geometry — BASE (why SWEEP ≠ BREAKOUT) ──")
-    print(f"{'Type':<9} {'n':>4}  {'AvgRisk':>8}  {'AvgTP1dist':>10}  {'AvgTP2dist':>10}  {'TP1/Risk':>8}")
-    print("─" * 60)
-    for itype in ('SWEEP', 'BREAKOUT'):
-        sigs = [s for s, _ in results['BASE'] if s.interaction == itype]
-        if not sigs:
-            continue
-        risks    = [abs(s.entry - s.sl)          for s in sigs]
-        tp1_dist = [abs(s.tp1  - s.entry)        for s in sigs]
-        tp2_dist = [abs(s.tp2  - s.entry)        for s in sigs]
-        rr1s     = [s.rr1                         for s in sigs]
-        avg_r    = sum(risks)    / len(risks)
-        avg_tp1  = sum(tp1_dist) / len(tp1_dist)
-        avg_tp2  = sum(tp2_dist) / len(tp2_dist)
-        avg_rr1  = sum(rr1s)    / len(rr1s)
-        print(f"{itype:<9} {len(sigs):>4}  {avg_r:>8.1f}  {avg_tp1:>10.1f}  {avg_tp2:>10.1f}  {avg_rr1:>8.2f}R")
+    if 'BASE' in active_variants:
+        print()
+        print("── TP geometry — BASE (why SWEEP ≠ BREAKOUT) ──")
+        print(f"{'Type':<9} {'n':>4}  {'AvgRisk':>8}  {'AvgTP1dist':>10}  {'AvgTP2dist':>10}  {'TP1/Risk':>8}")
+        print("─" * 60)
+        for itype in ('SWEEP', 'BREAKOUT'):
+            sigs = [s for s, _ in results['BASE'] if s.interaction == itype]
+            if not sigs:
+                continue
+            risks    = [abs(s.entry - s.sl)          for s in sigs]
+            tp1_dist = [abs(s.tp1  - s.entry)        for s in sigs]
+            tp2_dist = [abs(s.tp2  - s.entry)        for s in sigs]
+            rr1s     = [s.rr1                         for s in sigs]
+            avg_r    = sum(risks)    / len(risks)
+            avg_tp1  = sum(tp1_dist) / len(tp1_dist)
+            avg_tp2  = sum(tp2_dist) / len(tp2_dist)
+            avg_rr1  = sum(rr1s)    / len(rr1s)
+            print(f"{itype:<9} {len(sigs):>4}  {avg_r:>8.1f}  {avg_tp1:>10.1f}  {avg_tp2:>10.1f}  {avg_rr1:>8.2f}R")
 
     # OPEN count (not yet resolved in the 200-candle window)
     print()
-    opens = {v: sum(1 for _, o in results[v] if o == 'OPEN') for v in VARIANT_DEFS}
+    opens = {v: sum(1 for _, o in results[v] if o == 'OPEN') for v in active_variants}
     if any(opens.values()):
         print("Note — unresolved signals (still OPEN after 200 candles):")
         for v, n in opens.items():
