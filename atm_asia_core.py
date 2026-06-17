@@ -104,7 +104,8 @@ class OrderBlock:
     low:         float
     bias:        Bias
     source_time: datetime
-    valid:       bool = True
+    valid:       bool  = True
+    ob_body:     float = 0.0  # abs(close - open) of OB source candle
 
     @property
     def mid(self) -> float: return (self.high + self.low) / 2
@@ -136,6 +137,7 @@ class ATMContext:
     interaction_candle_high: float = 0.0   # high of the candle that triggered interaction
     interaction_candle_low:  float = 0.0   # low of the candle that triggered interaction
     ob_timeframe:            str = "1m"    # "1m" or "5m" depending on Tokyo session
+    choch_body_ratio:        float = 0.0  # body/range of CHoCH candle (for COMBSB32 filter)
     checklist: dict = field(default_factory=lambda: {
         "time_filter":   False,
         "asia_range":    False,
@@ -276,9 +278,9 @@ def find_ob(candles: List[Candle], bias: Bias, lookback: int = 30) -> Optional[O
     """
     for c in reversed(candles[-lookback:]):
         if bias == Bias.LONG and not c.is_bullish:
-            return OrderBlock(high=c.high, low=c.low, bias=bias, source_time=c.ts)
+            return OrderBlock(high=c.high, low=c.low, bias=bias, source_time=c.ts, ob_body=c.body_size)
         if bias == Bias.SHORT and c.is_bullish:
-            return OrderBlock(high=c.high, low=c.low, bias=bias, source_time=c.ts)
+            return OrderBlock(high=c.high, low=c.low, bias=bias, source_time=c.ts, ob_body=c.body_size)
     return None
 
 
@@ -501,6 +503,8 @@ def process_candle(
             (ctx.bias == Bias.SHORT and candle.close < ctx.interaction_candle_low)
         )
         if choch:
+            _cr = candle.high - candle.low
+            ctx.choch_body_ratio = (candle.body_size / _cr) if _cr > 0 else 0.0
             use_5m = post_tokyo
             if use_5m:
                 klines_5m = fetch_klines(SYMBOL, "5m", 60)
@@ -671,8 +675,10 @@ def _build_signal(ctx: ATMContext, candle: Candle) -> dict:
         "rr2":         round(rr2, 2),
         "asia_high":   ctx.asia_high,
         "asia_low":    ctx.asia_low,
-        "ob_high":     ctx.ob.high,
-        "ob_low":      ctx.ob.low,
+        "ob_high":          ctx.ob.high,
+        "ob_low":           ctx.ob.low,
+        "ob_body":          ctx.ob.ob_body,
+        "choch_body_ratio": ctx.choch_body_ratio,
         "signal_time": candle.ts.isoformat(),
         "telegram_message": msg,
     }

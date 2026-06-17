@@ -406,6 +406,8 @@ def ensure_atm_signal_columns(conn: sqlite3.Connection) -> None:
         "sl_hit_price": "REAL",
         "last_price": "REAL",
         "last_price_time_utc": "TEXT",
+        "variant": "TEXT NOT NULL DEFAULT 'BASE'",
+        "session": "TEXT NOT NULL DEFAULT ''",
     }
     for name, ddl in columns.items():
         if name not in existing:
@@ -793,14 +795,35 @@ def _to_utc_iso(ts: str) -> str:
     return datetime.fromisoformat(ts).astimezone(timezone.utc).isoformat()
 
 
+def _classify_signal_session(ts_iso: str) -> str:
+    """Return session bucket for a TW-timezone timestamp ISO string."""
+    try:
+        from atm_asia_core import kill_zone_windows, TW_TZ
+        ts = datetime.fromisoformat(ts_iso).astimezone(TW_TZ)
+        w = kill_zone_windows(ts)
+        m = ts.hour * 60 + ts.minute
+        london = w["te"] + 4 * 60
+        if m < w["ae"]:    return "Asia-KZ"
+        elif m < w["ts"]:  return "Post-Asia"
+        elif m < w["te"]:  return "Tokyo-KZ"
+        elif m < london:   return "Post-Tokyo"
+        elif m < w["us"]:  return "London/Pre-NY"
+        else:              return "NY+"
+    except Exception:
+        return ""
+
+
 def insert_atm_signal(
     conn: sqlite3.Connection,
     symbol: str,
     signal: dict[str, object],
+    variant: str = "BASE",
+    session: str = "",
 ) -> bool:
-    signal_key = str(signal.get("signal_key") or signal.get("signal_time") or "")
-    if not signal_key:
+    base_key = str(signal.get("signal_key") or signal.get("signal_time") or "")
+    if not base_key:
         return False
+    signal_key = f"{base_key}|{variant}" if variant != "BASE" else base_key
 
     row = conn.execute(
         "SELECT 1 FROM atm_signals WHERE signal_key=? LIMIT 1",
@@ -811,12 +834,15 @@ def insert_atm_signal(
 
     signal_time_utc = _to_utc_iso(str(signal["signal_time"]))
     created_time_utc = now_utc().isoformat()
+    if not session:
+        session = _classify_signal_session(str(signal["signal_time"]))
     conn.execute(
         """
         INSERT INTO atm_signals(
             signal_key, symbol, direction, interaction, signal_time_utc, created_time_utc,
-            entry_price, sl_price, tp1_price, tp2_price, rr_tp1, rr_tp2, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')
+            entry_price, sl_price, tp1_price, tp2_price, rr_tp1, rr_tp2, status,
+            variant, session
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
         """,
         (
             signal_key,
@@ -831,6 +857,8 @@ def insert_atm_signal(
             float(signal["tp2"]),
             float(signal.get("rr1") or 0),
             float(signal.get("rr2") or 0),
+            variant,
+            session,
         ),
     )
     conn.commit()
@@ -1032,6 +1060,40 @@ def fetch_atm_live_price(symbol: str, interval: str) -> float:
     return float(latest["close"])
 
 
+def atm_signal_stats_by_variant_session(
+    conn: sqlite3.Connection, where_sql: str = "", params: tuple[object, ...] = ()
+) -> list[sqlite3.Row]:
+    """Stats grouped by variant × session × interaction for nightly session breakdown."""
+    conn.row_factory = sqlite3.Row
+    sql = f"""
+        SELECT
+            COALESCE(variant, 'BASE') AS variant,
+            COALESCE(session, '') AS session,
+            interaction,
+            COUNT(*) AS signals,
+            SUM(CASE WHEN final_outcome IS NOT NULL THEN 1 ELSE 0 END) AS closed_signals,
+            SUM(CASE WHEN final_outcome IN ('TP1','TP2') THEN 1 ELSE 0 END) AS wins,
+            SUM(CASE WHEN final_outcome='SL'  THEN 1 ELSE 0 END) AS final_sl,
+            SUM(CASE
+                WHEN final_outcome='TP2' THEN 0.75*rr_tp1 + 0.25*rr_tp2
+                WHEN final_outcome='TP1' THEN 0.75*rr_tp1 - 0.25
+                ELSE 0.0
+            END) AS gross_profit_r,
+            SUM(CASE
+                WHEN final_outcome='SL' THEN 1.0
+                WHEN final_outcome='TP1' AND 0.75*rr_tp1 < 0.25 THEN 0.25 - 0.75*rr_tp1
+                ELSE 0.0
+            END) AS gross_loss_r
+        FROM atm_signals
+        {where_sql}
+        GROUP BY variant, session, interaction
+        ORDER BY variant, session, interaction
+    """
+    rows = conn.execute(sql, params).fetchall()
+    conn.row_factory = None
+    return rows
+
+
 def atm_signal_stats_by_interaction(
     conn: sqlite3.Connection, where_sql: str = "", params: tuple[object, ...] = ()
 ) -> list[sqlite3.Row]:
@@ -1090,13 +1152,21 @@ def atm_signal_stats(conn: sqlite3.Connection, where_sql: str = "", params: tupl
 
 def build_atm_summary_message(conn: sqlite3.Connection, now_tw: datetime) -> str:
     today_tw = now_tw.strftime("%Y-%m-%d")
-    overall = atm_signal_stats(conn)
-    today = atm_signal_stats(
+    today_where = "WHERE date(signal_time_utc, '+8 hours') = ?"
+    today_params = (today_tw,)
+
+    overall = atm_signal_stats(conn, "WHERE COALESCE(variant,'BASE')='BASE'")
+    today   = atm_signal_stats(conn, f"{today_where} AND COALESCE(variant,'BASE')='BASE'", today_params)
+    by_type = atm_signal_stats_by_interaction(conn, "WHERE COALESCE(variant,'BASE')='BASE'")
+
+    # today session breakdown (BASE only)
+    session_rows = atm_signal_stats_by_variant_session(
         conn,
-        "WHERE date(signal_time_utc, '+8 hours') = ?",
-        (today_tw,),
+        f"{today_where} AND COALESCE(variant,'BASE')='BASE'",
+        today_params,
     )
-    by_type = atm_signal_stats_by_interaction(conn)
+    # historical COMBSB32
+    combsb32_rows = atm_signal_stats_by_interaction(conn, "WHERE variant='COMBSB32'")
 
     def win_rate(row: sqlite3.Row) -> float:
         closed = int(row["closed_signals"] or 0)
@@ -1110,6 +1180,15 @@ def build_atm_summary_message(conn: sqlite3.Connection, now_tw: datetime) -> str
             return "∞" if gp > 0 else "–"
         return f"{gp / gl:.2f}"
 
+    def avg_r(row: sqlite3.Row) -> str:
+        closed = int(row["closed_signals"] or 0)
+        if closed == 0:
+            return "–"
+        net = float(row["gross_profit_r"] or 0) - float(row["gross_loss_r"] or 0)
+        sign = "+" if net >= 0 else ""
+        return f"{sign}{net / closed:.2f}R"
+
+    # SWEEP vs BREAKOUT (BASE historical)
     type_lines = []
     for r in by_type:
         closed = int(r["closed_signals"] or 0)
@@ -1118,23 +1197,54 @@ def build_atm_summary_message(conn: sqlite3.Connection, now_tw: datetime) -> str
         wr = round(int(r["wins"] or 0) / closed * 100, 1)
         type_lines.append(
             f"  {r['interaction']:9s} {closed:3d}筆  勝率 {wr:.0f}%"
-            f"  PF {pf(r)}"
-            f"  (TP2 {int(r['final_tp2'] or 0)} / TP1 {int(r['final_tp1'] or 0)} / SL {int(r['final_sl'] or 0)})"
+            f"  PF {pf(r)}  AvgR {avg_r(r)}"
         )
     type_section = "\n".join(type_lines) if type_lines else "  尚無已完成交易"
 
+    # today session × interaction table (BASE)
+    SESSION_ORDER = ["Asia-KZ", "Post-Asia", "Tokyo-KZ", "Post-Tokyo", "London/Pre-NY", "NY+", ""]
+    sess_lines = []
+    last_sess = None
+    for r in sorted(session_rows, key=lambda x: (SESSION_ORDER.index(x["session"]) if x["session"] in SESSION_ORDER else 99, x["interaction"])):
+        sess = r["session"] or "Unknown"
+        closed = int(r["closed_signals"] or 0)
+        if sess != last_sess:
+            sess_lines.append(f"  {sess}")
+            last_sess = sess
+        win_pct = f"{int(r['wins'] or 0) / closed * 100:.0f}%" if closed else "–"
+        sess_lines.append(
+            f"    {r['interaction']:9s} {int(r['signals'] or 0)}筆  完成{closed}  勝{win_pct}  {avg_r(r)}"
+        )
+    sess_section = "\n".join(sess_lines) if sess_lines else "  今日尚無 signals"
+
+    # COMBSB32 summary
+    cb_lines = []
+    for r in combsb32_rows:
+        closed = int(r["closed_signals"] or 0)
+        if closed == 0:
+            continue
+        wr = round(int(r["wins"] or 0) / closed * 100, 1)
+        cb_lines.append(
+            f"  {r['interaction']:9s} {closed:3d}筆  勝率 {wr:.0f}%"
+            f"  PF {pf(r)}  AvgR {avg_r(r)}"
+        )
+    cb_section = "\n".join(cb_lines) if cb_lines else "  尚無已完成交易"
+
     return (
         f"📊 ATM 夜間統計 {today_tw}\n"
-        f"今日 signals: {int(today['signals'] or 0)}  已完成: {int(today['closed_signals'] or 0)}  開放中: {int(today['open_signals'] or 0)}\n"
+        f"今日 signals(BASE): {int(today['signals'] or 0)}  已完成: {int(today['closed_signals'] or 0)}  開放中: {int(today['open_signals'] or 0)}\n"
         f"今日勝率: {win_rate(today):.1f}%  (TP1/TP2 視為 win)\n"
         f"今日最終結果: TP2 {int(today['final_tp2'] or 0)} / TP1 {int(today['final_tp1'] or 0)} / SL {int(today['final_sl'] or 0)}\n"
         f"今日觸及次數: TP1 {int(today['hit_tp1'] or 0)} / TP2 {int(today['hit_tp2'] or 0)} / SL {int(today['hit_sl'] or 0)}\n"
-        f"歷史 signals: {int(overall['signals'] or 0)}  已完成: {int(overall['closed_signals'] or 0)}\n"
+        f"歷史 signals(BASE): {int(overall['signals'] or 0)}  已完成: {int(overall['closed_signals'] or 0)}\n"
         f"歷史勝率: {win_rate(overall):.1f}%\n"
         f"歷史最終結果: TP2 {int(overall['final_tp2'] or 0)} / TP1 {int(overall['final_tp1'] or 0)} / SL {int(overall['final_sl'] or 0)}\n"
-        f"歷史觸及次數: TP1 {int(overall['hit_tp1'] or 0)} / TP2 {int(overall['hit_tp2'] or 0)} / SL {int(overall['hit_sl'] or 0)}\n"
-        f"── SWEEP vs BREAKOUT（歷史）──\n"
-        f"{type_section}"
+        f"── 今日 Session 分類（BASE）──\n"
+        f"{sess_section}\n"
+        f"── SWEEP vs BREAKOUT（BASE 歷史）──\n"
+        f"{type_section}\n"
+        f"── COMBSB32（歷史）──\n"
+        f"{cb_section}"
     )
 
 
@@ -1511,7 +1621,7 @@ def _atm_thread(cfg: Config) -> None:
                     if signal_key and signal_key == last_signal_key:
                         LOGGER.info("[ATM] duplicate signal skipped key=%s", signal_key)
                         continue
-                    inserted = insert_atm_signal(conn, ATM_SYMBOL, signal)
+                    inserted = insert_atm_signal(conn, ATM_SYMBOL, signal, variant="BASE")
                     if not inserted:
                         LOGGER.info("[ATM] signal already recorded in DB key=%s", signal_key)
                         last_signal_key = signal_key
@@ -1521,6 +1631,20 @@ def _atm_thread(cfg: Config) -> None:
                         signal["direction"], signal["entry"],
                         signal["sl"], signal["tp1"], signal["tp2"],
                     )
+
+                    # COMBSB32: SWEEP needs OB body >= 10pts; BREAKOUT needs CHoCH body >= 50%
+                    _COMBSB32_OB_MIN = 10.0
+                    _interaction = str(signal.get("interaction", "")).upper()
+                    _ob_body = float(signal.get("ob_body") or 0)
+                    _choch_ratio = float(signal.get("choch_body_ratio") or 0)
+                    _combsb32_pass = (
+                        (_interaction == "SWEEP"    and _ob_body >= _COMBSB32_OB_MIN) or
+                        (_interaction == "BREAKOUT" and _choch_ratio >= 0.5)
+                    )
+                    if _combsb32_pass:
+                        insert_atm_signal(conn, ATM_SYMBOL, signal, variant="COMBSB32")
+                        LOGGER.info("[ATM] COMBSB32 signal recorded  interaction=%s  ob_body=%.1f  choch_ratio=%.2f",
+                                    _interaction, _ob_body, _choch_ratio)
                     log_event(
                         conn,
                         "INFO",
