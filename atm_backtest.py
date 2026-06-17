@@ -64,11 +64,12 @@ class Signal:
 
 @dataclass
 class Opts:
-    dynamic_invalid:  bool  = False
-    choch_body_filter: bool = False
-    ob_min_body:      float = 0.0
-    require_fvg:      bool  = False
-    no_reinteract:    bool  = False
+    dynamic_invalid:   bool  = False
+    choch_body_filter: bool  = False
+    ob_min_body:       float = 0.0
+    require_fvg:       bool  = False
+    no_reinteract:     bool  = False
+    breakout_only:     bool  = False  # skip all SWEEP interactions
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BingX data fetch with pagination
@@ -273,6 +274,9 @@ def sim_day(day_1m: list[Candle], day_5m: list[Candle], opts: Opts) -> list[Sign
                 interaction = 'SWEEP' if candle.close >= c_ref_l else 'BREAKOUT'
             else:
                 continue
+            # OPT BKOUT: skip sweep interactions entirely
+            if opts.breakout_only and interaction == 'SWEEP':
+                bias = None; continue
             inter_h = candle.high
             inter_l = candle.low
             dyn_l   = candle.low
@@ -427,21 +431,25 @@ def calc_stats(trades: list[tuple]) -> dict:
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 VARIANT_DEFS = {
-    'BASE': Opts(),
-    'OPT1': Opts(dynamic_invalid=True),
-    'OPT2': Opts(choch_body_filter=True),
-    'OPT3': None,   # ob_min_body set from args
-    'OPT4': Opts(require_fvg=True),
-    'OPT5': Opts(no_reinteract=True),
+    'BASE':   Opts(),
+    'OPT1':   Opts(dynamic_invalid=True),
+    'OPT2':   Opts(choch_body_filter=True),
+    'OPT3':   None,   # ob_min_body set from args
+    'OPT4':   Opts(require_fvg=True),
+    'OPT5':   Opts(no_reinteract=True),
+    'COMB13': None,   # OPT1 + OPT3, set from args
+    'BKOUT':  Opts(), # BREAKOUT-only (SWEEP disabled in sim_day via flag)
 }
 
 VARIANT_DESC = {
-    'BASE': 'current logic',
-    'OPT1': 'dynamic CHoCH invalidation level',
-    'OPT2': 'CHoCH body/range >= 50%',
-    'OPT3': 'OB min body filter',
-    'OPT4': 'OB must have FVG after it',
-    'OPT5': 'no re-interaction after signal',
+    'BASE':   'current logic',
+    'OPT1':   'dynamic CHoCH invalidation level',
+    'OPT2':   'CHoCH body/range >= 50%',
+    'OPT3':   'OB min body filter',
+    'OPT4':   'OB must have FVG after it',
+    'OPT5':   'no re-interaction after signal',
+    'COMB13': 'OPT1 + OPT3 combined',
+    'BKOUT':  'BREAKOUT signals only (no SWEEP)',
 }
 
 def main():
@@ -454,8 +462,12 @@ def main():
                     help='OPT4 FVG lookahead window (default 8 candles)')
     args = ap.parse_args()
 
-    VARIANT_DEFS['OPT3'] = Opts(ob_min_body=args.ob_min_body)
-    VARIANT_DESC['OPT3'] = f'OB min body >= {args.ob_min_body} pts'
+    VARIANT_DEFS['OPT3']   = Opts(ob_min_body=args.ob_min_body)
+    VARIANT_DESC['OPT3']   = f'OB min body >= {args.ob_min_body} pts'
+    VARIANT_DEFS['COMB13'] = Opts(dynamic_invalid=True, ob_min_body=args.ob_min_body)
+    VARIANT_DESC['COMB13'] = f'OPT1 + OPT3 (dynamic invalid + ob_min_body={args.ob_min_body})'
+    VARIANT_DEFS['BKOUT']  = Opts(breakout_only=True)
+    VARIANT_DESC['BKOUT']  = 'BREAKOUT signals only (no SWEEP)'
 
     now      = datetime.now(tz=TW_TZ)
     start    = now - timedelta(days=args.days)
@@ -541,6 +553,25 @@ def main():
             st = calc_stats(subset)
             pf = f"{st['pf']:.2f}" if st['pf'] != float('inf') else "  ∞"
             print(f"{vname:<7} {itype:<9} {st['closed']:>6} {st['wr']:>5.1f}% {pf:>6} {st['avgr']:>+6.2f}R")
+
+    # ── TP geometry analysis (BASE only — explains SWEEP vs BREAKOUT asymmetry) ──
+    print()
+    print("── TP geometry — BASE (why SWEEP ≠ BREAKOUT) ──")
+    print(f"{'Type':<9} {'n':>4}  {'AvgRisk':>8}  {'AvgTP1dist':>10}  {'AvgTP2dist':>10}  {'TP1/Risk':>8}")
+    print("─" * 60)
+    for itype in ('SWEEP', 'BREAKOUT'):
+        sigs = [s for s, _ in results['BASE'] if s.interaction == itype]
+        if not sigs:
+            continue
+        risks    = [abs(s.entry - s.sl)          for s in sigs]
+        tp1_dist = [abs(s.tp1  - s.entry)        for s in sigs]
+        tp2_dist = [abs(s.tp2  - s.entry)        for s in sigs]
+        rr1s     = [s.rr1                         for s in sigs]
+        avg_r    = sum(risks)    / len(risks)
+        avg_tp1  = sum(tp1_dist) / len(tp1_dist)
+        avg_tp2  = sum(tp2_dist) / len(tp2_dist)
+        avg_rr1  = sum(rr1s)    / len(rr1s)
+        print(f"{itype:<9} {len(sigs):>4}  {avg_r:>8.1f}  {avg_tp1:>10.1f}  {avg_tp2:>10.1f}  {avg_rr1:>8.2f}R")
 
     # OPEN count (not yet resolved in the 200-candle window)
     print()
