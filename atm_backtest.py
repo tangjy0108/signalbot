@@ -73,6 +73,25 @@ class Opts:
     no_reinteract:     bool  = False
     breakout_only:     bool  = False  # skip all SWEEP interactions
     sweep_tp1_r:       float = 0.0    # OPT6/7: fixed-R TP1 for SWEEP (0=use ref_high)
+    # COMBSB: per-interaction overrides (-1 = not set, use global field)
+    sweep_ob_min_body:    float = -1.0  # SWEEP-specific ob_min_body
+    bo_dynamic_invalid:   bool  = False # BREAKOUT-specific dynamic_invalid
+    bo_choch_body_filter: bool  = False # BREAKOUT-specific choch_body_filter
+
+    def eff_dynamic(self, interaction: str) -> bool:
+        if interaction == 'BREAKOUT':
+            return self.dynamic_invalid or self.bo_dynamic_invalid
+        return self.dynamic_invalid
+
+    def eff_choch_filter(self, interaction: str) -> bool:
+        if interaction == 'BREAKOUT':
+            return self.choch_body_filter or self.bo_choch_body_filter
+        return self.choch_body_filter
+
+    def eff_ob_min_body(self, interaction: str) -> float:
+        if interaction == 'SWEEP' and self.sweep_ob_min_body >= 0:
+            return self.sweep_ob_min_body
+        return self.ob_min_body
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BingX data fetch with pagination
@@ -317,7 +336,7 @@ def sim_day(day_1m: list[Candle], day_5m: list[Candle], opts: Opts) -> list[Sign
         # ── WAITING_CHOCH ─────────────────────────────────────────
         elif state == 'WAITING_CHOCH':
             # OPT1: dynamic invalidation (track running min/max)
-            if opts.dynamic_invalid:
+            if opts.eff_dynamic(interaction):
                 dyn_l = min(dyn_l, candle.low)
                 dyn_h = max(dyn_h, candle.high)
                 inv_l, inv_h = dyn_l, dyn_h
@@ -336,19 +355,20 @@ def sim_day(day_1m: list[Candle], day_5m: list[Candle], opts: Opts) -> list[Sign
                 continue
 
             # OPT2: require strong displacement body
-            if opts.choch_body_filter and candle.body_ratio < 0.5:
+            if opts.eff_choch_filter(interaction) and candle.body_ratio < 0.5:
                 continue
 
             # Find OB: post-Tokyo → try 5m, else 1m
+            ob_min = opts.eff_ob_min_body(interaction)
             if post_tok and day_5m:
                 cts = candle.ts.timestamp()
                 j5 = max((i for i, c in enumerate(day_5m)
                            if c.ts.timestamp() <= cts), default=0)
-                ob = find_ob(day_5m, bias, j5, min_body=opts.ob_min_body)
+                ob = find_ob(day_5m, bias, j5, min_body=ob_min)
                 ob_src = day_5m
             else:
                 j1 = idx_1m[id(candle)]
-                ob = find_ob(day_1m, bias, j1, min_body=opts.ob_min_body)
+                ob = find_ob(day_1m, bias, j1, min_body=ob_min)
                 ob_src = day_1m
 
             # OPT4: require FVG after the OB candle
@@ -455,21 +475,27 @@ VARIANT_DEFS = {
     'OPT5':   Opts(no_reinteract=True),
     'COMB13': None,   # OPT1 + OPT3, set from args
     'BKOUT':  Opts(), # BREAKOUT-only (SWEEP disabled in sim_day via flag)
-    'OPT6':   Opts(sweep_tp1_r=2.0),  # SWEEP TP1=2R, TP2=ref_high
-    'OPT7':   Opts(sweep_tp1_r=3.0),  # SWEEP TP1=3R, TP2=ref_high
+    'OPT6':     Opts(sweep_tp1_r=2.0),  # SWEEP TP1=2R, TP2=ref_high
+    'OPT7':     Opts(sweep_tp1_r=3.0),  # SWEEP TP1=3R, TP2=ref_high
+    'COMB23':   None,  # OPT2 + OPT3 applied to all, set from args
+    'COMBSB31': None,  # SWEEP=OPT3, BREAKOUT=OPT1, set from args
+    'COMBSB32': None,  # SWEEP=OPT3, BREAKOUT=OPT2, set from args
 }
 
 VARIANT_DESC = {
-    'BASE':   'current logic',
-    'OPT1':   'dynamic CHoCH invalidation level',
-    'OPT2':   'CHoCH body/range >= 50%',
-    'OPT3':   'OB min body filter',
-    'OPT4':   'OB must have FVG after it',
-    'OPT5':   'no re-interaction after signal',
-    'COMB13': 'OPT1 + OPT3 combined',
-    'BKOUT':  'BREAKOUT signals only (no SWEEP)',
-    'OPT6':   'SWEEP TP1=2R fixed, TP2=ref_high',
-    'OPT7':   'SWEEP TP1=3R fixed, TP2=ref_high',
+    'BASE':     'current logic',
+    'OPT1':     'dynamic CHoCH invalidation level',
+    'OPT2':     'CHoCH body/range >= 50%',
+    'OPT3':     'OB min body filter',
+    'OPT4':     'OB must have FVG after it',
+    'OPT5':     'no re-interaction after signal',
+    'COMB13':   'OPT1 + OPT3 combined',
+    'BKOUT':    'BREAKOUT signals only (no SWEEP)',
+    'OPT6':     'SWEEP TP1=2R fixed, TP2=ref_high',
+    'OPT7':     'SWEEP TP1=3R fixed, TP2=ref_high',
+    'COMB23':   'OPT2 + OPT3 (CHoCH body + OB body, all signals)',
+    'COMBSB31': 'SWEEP=OPT3 (ob_min_body), BREAKOUT=OPT1 (dynamic invalid)',
+    'COMBSB32': 'SWEEP=OPT3 (ob_min_body), BREAKOUT=OPT2 (CHoCH body filter)',
 }
 
 def main():
@@ -482,12 +508,19 @@ def main():
                     help='OPT4 FVG lookahead window (default 8 candles)')
     args = ap.parse_args()
 
-    VARIANT_DEFS['OPT3']   = Opts(ob_min_body=args.ob_min_body)
-    VARIANT_DESC['OPT3']   = f'OB min body >= {args.ob_min_body} pts'
-    VARIANT_DEFS['COMB13'] = Opts(dynamic_invalid=True, ob_min_body=args.ob_min_body)
-    VARIANT_DESC['COMB13'] = f'OPT1 + OPT3 (dynamic invalid + ob_min_body={args.ob_min_body})'
-    VARIANT_DEFS['BKOUT']  = Opts(breakout_only=True)
-    VARIANT_DESC['BKOUT']  = 'BREAKOUT signals only (no SWEEP)'
+    mb = args.ob_min_body
+    VARIANT_DEFS['OPT3']     = Opts(ob_min_body=mb)
+    VARIANT_DESC['OPT3']     = f'OB min body >= {mb} pts'
+    VARIANT_DEFS['COMB13']   = Opts(dynamic_invalid=True, ob_min_body=mb)
+    VARIANT_DESC['COMB13']   = f'OPT1 + OPT3 (dynamic invalid + ob_min_body={mb})'
+    VARIANT_DEFS['BKOUT']    = Opts(breakout_only=True)
+    VARIANT_DESC['BKOUT']    = 'BREAKOUT signals only (no SWEEP)'
+    VARIANT_DEFS['COMB23']   = Opts(choch_body_filter=True, ob_min_body=mb)
+    VARIANT_DESC['COMB23']   = f'OPT2 + OPT3 (CHoCH body + ob_min_body={mb})'
+    VARIANT_DEFS['COMBSB31'] = Opts(sweep_ob_min_body=mb, bo_dynamic_invalid=True)
+    VARIANT_DESC['COMBSB31'] = f'SWEEP=OPT3(ob>={mb}), BREAKOUT=OPT1(dynamic invalid)'
+    VARIANT_DEFS['COMBSB32'] = Opts(sweep_ob_min_body=mb, bo_choch_body_filter=True)
+    VARIANT_DESC['COMBSB32'] = f'SWEEP=OPT3(ob>={mb}), BREAKOUT=OPT2(CHoCH body)'
 
     now      = datetime.now(tz=TW_TZ)
     start    = now - timedelta(days=args.days)
