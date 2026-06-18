@@ -406,7 +406,11 @@ def ensure_atm_signal_columns(conn: sqlite3.Connection) -> None:
     }
     for name, ddl in columns.items():
         if name not in existing:
-            conn.execute(f"ALTER TABLE atm_signals ADD COLUMN {name} {ddl}")
+            try:
+                conn.execute(f"ALTER TABLE atm_signals ADD COLUMN {name} {ddl}")
+            except sqlite3.OperationalError as _e:
+                if "duplicate column name" not in str(_e):
+                    raise
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_atm_signals_signal_key ON atm_signals(signal_key)"
     )
